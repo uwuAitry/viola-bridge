@@ -17,6 +17,9 @@ repository = "https://github.com/uwuAitry/viola-bridge"
 rust-version = "1.87.0"
 
 [workspace.dependencies]
-abi_stable = "0.11"
+# Pinned exactly: `orender` statically links abi_stable too, and the runtime
+# checks ABI layout, so a drifting 0.11.x could refuse to load the plugin.
+# This is the version upstream's own Cargo.lock resolves at the pinned revision.
+abi_stable = "=0.11.3"
 # Path into the pinned upstream checkout created by scripts/bootstrap.ps1.
 bridge_api = { path = "third_party/Omniphony/omniphony-renderer/bridge_api" }
