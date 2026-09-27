@@ -86,6 +86,41 @@ The pinned revision is `b81f518831e89864a6391744cf9daa9eeadb3c51` — the commit
 the author's local `orender` reports as its build string (`b81f518-dirty`), so
 the plugin ABI matches the engine by construction.
 
+## Verifying locally
+
+```powershell
+pwsh -File scripts/verify-channel-bed.ps1 `
+  -BridgePath dist\viola-bridge-windows-x86_64\viola_bridge.dll
+```
+
+It renders a generated 16-channel 1 kHz probe through the plugin with the
+installed `orender` and prints per-channel levels of the render dump. The
+engine's config is only read — the script passes no `--config` and never uses
+`--save-config`.
+
+Two upstream behaviours the script accounts for:
+
+- With `--output-backend file`, loading a bridge puts the engine into its live
+  input manager, so it decodes the whole stream (`Processing complete: 47
+  frames`) and then keeps running. The script waits for the dump to stop growing
+  and kills it. **This happens with the upstream reference bridge too** — it is
+  not something viola-bridge causes.
+- The first write is at the layout width (16 channels); the binaural stage then
+  narrows it to 2. The script reads the last `Writing rendered audio … N
+  channels` line to pick the width for analysis.
+
+Measured on 2026-09-27 with the CI artifact:
+
+```
+Speaker layout: 16 speakers (FL, FR, C, LFE, FWL, FWR, SL, SR, BL, BR, TFL, TFR, TSL, TSR, TBL, TBR)
+Processing complete: 47 frames
+Label to speaker mapping (by name): {…, Lw: 4, Rw: 5, Tsl: 12, Tsr: 13, Tbl: 14, Tbr: 15}
+verdict    : AUDIBLE
+```
+
+The `Lw`/`Rw`/`Tsl`/`Tsr`/`Tbl`/`Tbr` entries in that mapping are the observable
+difference from the upstream reference bridge, which labels at most 12 channels.
+
 ## Layout
 
 ```
