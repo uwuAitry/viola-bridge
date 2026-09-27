@@ -57,6 +57,42 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  viola-feeder:
+    name: viola_feeder.exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Fetch pinned upstream bridge_api
+        shell: pwsh
+        run: ./scripts/bootstrap.ps1 -Revision $env:UPSTREAM_REV
+
+      - name: Build the feeder
+        shell: pwsh
+        run: cargo build --release -p viola_feeder
+
+      - name: Stage artifact + hashes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/viola_feeder.exe dist/
+          Get-FileHash dist/viola_feeder.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  viola_feeder.exe" } |
+            Set-Content dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viola-feeder-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+
   upstream-reference-bridge:
     name: reference_bridge.dll (upstream baseline)
     runs-on: windows-latest

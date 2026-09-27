@@ -158,6 +158,48 @@ or simply connect to it as a client.
 With `--continuous` the engine loops back to waiting for the next client after
 the stream ends, which is why both probes kill it once the dump has settled.
 
+## Live capture (M3)
+
+`viola_feeder` captures a Windows endpoint through WASAPI and streams it into
+`\\.\pipe\orender.input` as a streaming WAV channel bed, so the renderer hears
+live audio. **No SDK and no vendor software are involved** — the whole boundary
+between what the cloud builds and what this machine may run is written down in
+[docs/cloud-boundary.md](docs/cloud-boundary.md).
+
+```powershell
+viola_feeder --list                                   # enumerate endpoints
+viola_feeder --seconds 10                             # loopback of the default output
+viola_feeder --device "Voicemeeter Out B1"            # a virtual cable's output
+viola_feeder --device "Voicemeeter Input" --loopback  # what is played into a virtual input
+```
+
+The engine has to be running against the same pipe:
+
+```
+orender.exe render \\.\pipe\orender.input --continuous --enable-vbap ^
+  --speaker-layout "layouts\9.1.6.yaml" --bridge-path "viola_bridge.dll" ^
+  --output-backend file --output-file out.f32
+```
+
+`orender` creates the pipe itself when it is missing, so the feeder just
+connects and retries until that succeeds; it also reconnects (and re-sends the
+44-byte header) whenever the engine tears the pipe down between streams.
+
+The format travels in-band: the feeder writes a RIFF/WAVE header whose `data`
+size is `0xFFFFFFFF` ("until the input ends") and `viola_bridge` reads the
+channel count and sample format from it, so no environment variable has to be
+kept in sync between the two processes.
+
+**Channel-count note (deliberate).** The WDM side of a virtual audio device is
+stereo, so this path carries 2 channels: it proves the *live chain*
+(DAW → virtual device → pipe → bridge → renderer), not 9.1.6's sixteen. Getting
+sixteen live channels needs one of the options in
+[docs/cloud-boundary.md §4](docs/cloud-boundary.md) — either the ASIO SDK at CI
+build time, or a multichannel virtual device. Both are currently **not** taken.
+
+See [docs/cloud-boundary.md](docs/cloud-boundary.md) for the rule that produced
+that choice.
+
 ## Layout
 
 ```
