@@ -121,6 +121,43 @@ verdict    : AUDIBLE
 The `Lw`/`Rw`/`Tsl`/`Tsr`/`Tbl`/`Tbr` entries in that mapping are the observable
 difference from the upstream reference bridge, which labels at most 12 channels.
 
+## Feeding through a pipe
+
+`orender` reads a named pipe natively — that is how Omniphony Studio drives its
+own engine (`orender render \\.\pipe\orender.input --continuous …`). Everything
+else is the producer's job:
+
+```powershell
+pwsh -File scripts/pipe-feed-probe.ps1 `
+  -BridgePath dist\viola-bridge-windows-x86_64\viola_bridge.dll
+```
+
+`scripts/pipe-feed-probe.ps1` creates `\\.\pipe\orender.input`, waits for the
+engine to attach, streams a 16-channel WAV into it, and reports the render dump.
+`-Realtime` paces the feed to the source's byte rate instead of dumping it as
+fast as possible. Only PowerShell/.NET is used, so the probe needs no local
+toolchain.
+
+Measured on 2026-09-27 (3 072 114 bytes fed):
+
+```
+Decoding stream from file: \\.\pipe\orender.input (presentation: best)
+Loading format bridge: …\viola_bridge.dll
+Processing complete: 49 frames
+Continuous mode: resetting bridge and waiting for new data...
+--- render dump: 379920 bytes, 2 channel(s) ---
+samples    : 94980 (47490 frames, 2 ch, 0.989s @ 48000 Hz)
+verdict    : AUDIBLE
+```
+
+Note the engine's own log line `sys::input] Creating Windows named pipe server
+(overlapped)`: when the pipe does not exist yet, `orender` creates it and waits
+for a client. A producer may therefore either serve the pipe (as the probe does)
+or simply connect to it as a client.
+
+With `--continuous` the engine loops back to waiting for the next client after
+the stream ends, which is why both probes kill it once the dump has settled.
+
 ## Layout
 
 ```
