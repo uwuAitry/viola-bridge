@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: https://github.com/mgth/Omniphony
+  # The exact revision the local `orender` reports as its build string
+  # (`b81f518-dirty`), so the ABI is matched by construction.
+  UPSTREAM_REV: b81f518831e89864a6391744cf9daa9eeadb3c51
+
+jobs:
+  viola-bridge:
+    name: viola_bridge.dll
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '.'
+
+      - name: Fetch pinned upstream bridge_api
+        shell: pwsh
+        run: ./scripts/bootstrap.ps1 -Revision $env:UPSTREAM_REV
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace --release
+
+      - name: Build
+        shell: pwsh
+        run: cargo build --workspace --release
+
+      - name: Stage artifact + hashes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/viola_bridge.dll dist/
+          Get-FileHash dist/viola_bridge.dll -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  viola_bridge.dll" } |
+            Set-Content dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viola-bridge-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  upstream-reference-bridge:
+    name: reference_bridge.dll (upstream baseline)
+    runs-on: windows-latest
+    steps:
+      - name: Clone pinned upstream
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none --no-checkout $env:UPSTREAM_REPO upstream
+          Push-Location upstream
+          git fetch --depth 1 origin $env:UPSTREAM_REV
+          git checkout --force $env:UPSTREAM_REV
+          Pop-Location
+          Get-Content upstream/omniphony-renderer/Cargo.toml -TotalCount 5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'upstream/omniphony-renderer'
+
+      - name: Build the upstream reference bridge
+        working-directory: upstream/omniphony-renderer
+        run: cargo build --release -p reference_bridge
+
+      - name: Stage artifact + hashes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item upstream/omniphony-renderer/target/release/reference_bridge.dll dist/
+          Get-FileHash dist/reference_bridge.dll -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  reference_bridge.dll" } |
+            Set-Content dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-reference-bridge-windows-x86_64
+          path: dist/
+          if-no-files-found: error

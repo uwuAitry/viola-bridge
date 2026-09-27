@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# viola-bridge — a channel-bed decoder bridge for the Omniphony renderer (`orender`).
+#
+# `bridge_api` is NOT vendored here: it is the upstream Omniphony crate
+# (GPL-3.0-or-later), and `third_party/Omniphony` is populated by
+# `scripts/bootstrap.ps1` at a pinned revision. See README.md § Layout.
+[workspace]
+resolver = "2"
+members = ["crates/viola_bridge"]
+exclude = ["third_party"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/uwuAitry/viola-bridge"
+rust-version = "1.87.0"
+
+[workspace.dependencies]
+abi_stable = "0.11"
+# Path into the pinned upstream checkout created by scripts/bootstrap.ps1.
+bridge_api = { path = "third_party/Omniphony/omniphony-renderer/bridge_api" }

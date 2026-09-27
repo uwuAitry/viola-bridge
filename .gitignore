@@ -1,0 +1,11 @@
+# Upstream reference checkout fetched by scripts/bootstrap.ps1 (never committed).
+/third_party/
+
+# Rust build output
+/target/
+
+# Local CI-artifact staging and probes
+/dist/
+/probe/
+*.f32
+*.caf

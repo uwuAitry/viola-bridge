@@ -1,0 +1,44 @@
+viola-bridge
+Copyright (C) 2026 uwuAitry and contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+1. Omniphony (`bridge_api`, `liborender`)
+   https://github.com/mgth/Omniphony
+   Licence: GPL-3.0-or-later
+   Used as a build-time dependency (pinned revision, fetched at build time; not
+   vendored in this repository). viola-bridge implements the `bridge_api`
+   plugin ABI, so the resulting shared library is a combined work under the
+   GPL. The name and ABI of that crate are the interface this plugin targets;
+   no upstream source is copied into this repository.
+
+2. abi_stable — https://github.com/rodrimati1992/abi_stable_crates
+   Licence: MIT OR Apache-2.0
+
+3. Omniphony's reference bridge (GPL-3.0-only) was consulted as an example of
+   how to use the ABI, and as the behavioural baseline this plugin is tested
+   against. Its source is not copied: the WAV header scanner and the sample
+   conversion in this repository are written independently, and the channel
+   label table differs (16-channel 9.1.6 support is added here).
+
+--------------------------------------------------------------------------------
+No ASIO SDK
+--------------------------------------------------------------------------------
+
+This project does not use or redistribute the Steinberg ASIO SDK. Any ASIO
+capture component, if added later, will live in a separate crate/target and
+document its own licence obligations.

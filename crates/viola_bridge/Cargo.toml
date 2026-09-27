@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "viola_bridge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Channel-bed decoder bridge for the Omniphony renderer: streams multichannel WAV or headerless PCM, with a full 9.1.6 (16-channel) label map"
+
+# cdylib: the loadable `*_bridge.dll` plugin the renderer auto-discovers.
+# rlib:   lets the unit tests link the crate directly.
+[lib]
+name = "viola_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+abi_stable.workspace = true
+bridge_api.workspace = true

@@ -1,0 +1,106 @@
+# viola-bridge
+
+A **decoder bridge plugin for the [Omniphony](https://github.com/mgth/Omniphony) renderer**
+(`orender`) that presents plain PCM as a channel bed — including a proper
+**9.1.6 (16-channel) label map**, which the upstream reference bridge does not
+have (it stops at 12 channels).
+
+`orender` does not decode anything by itself: it loads a `*_bridge.dll` /
+`lib*_bridge.so` at runtime and refuses to start without one. This repository
+builds that plugin **in the cloud**, so no local toolchain is required.
+
+## What it is for
+
+Feeding a DAW's multichannel output into `orender` for rendering, on Windows,
+where the engine's own `live` input is not implemented
+(`live input is not implemented on this platform`) and the `input-live` CLI
+subcommand is a stub.
+
+The intended shape is:
+
+```
+[your source] ──writes PCM──▶ \\.\pipe\orender.input ──▶ orender ──▶ viola_bridge ──▶ speakers / binaural
+                                                          (render … --bridge-path viola_bridge.dll)
+```
+
+`orender` reads a named pipe natively (`render \\.\pipe\orender.input
+--continuous`), so the pipe is the supported half of the problem; the bridge is
+the missing half, and that is what this repo provides.
+
+## Modes
+
+Selected by `VIOLA_BRIDGE_MODE` when the bridge instance is created:
+
+| mode | behaviour |
+|---|---|
+| `auto` (default) | a `RIFF`/`WAVE` byte stream is parsed as WAV; anything else is headerless PCM |
+| `wav` | always parse a WAVE header; a non-RIFF stream is a fatal error |
+| `raw` | never look for a header; the stream is headerless PCM |
+
+Headerless PCM takes its layout from the environment: `VIOLA_BRIDGE_CHANNELS`
+(default `16`), `VIOLA_BRIDGE_RATE` (default `48000`), `VIOLA_BRIDGE_FORMAT`
+(`f32` default, or `s16` / `s24` / `s32`).
+
+A WAV stream may declare its `data` chunk size as `0` or `0xFFFFFFFF` to mean
+"until the input ends" — which is what a live producer should write.
+
+Recognised channel counts: `1, 2, 6, 8, 10, 12, 16`. The 16-channel map is the
+9.1.6 order:
+
+```
+L R C LFE Lw Rw Ls Rs Lb Rb Tfl Tfr Tsl Tsr Tbl Tbr
+```
+
+## Installing the plugin
+
+Build it (see below), then place the DLL **next to `orender.exe`** — the host
+auto-discovers the first file matching `*_bridge.dll` in its own directory — or
+point at it explicitly:
+
+```
+orender.exe render \\.\pipe\orender.input --continuous --enable-vbap ^
+  --speaker-layout "layouts\9.1.6.yaml" ^
+  --bridge-path "viola_bridge.dll" ^
+  --output-backend file --output-file out.f32
+```
+
+`--bridge-path`, `render.bridge_path` in `%ProgramData%\omniphony\config.yaml`,
+the `ORENDER_BRIDGE_DIR` environment variable and auto-discovery are consulted in
+that order.
+
+## Building in the cloud
+
+`.github/workflows/build.yml` runs on `windows-latest` and publishes two
+artifacts:
+
+- `viola-bridge-windows-x86_64` — `viola_bridge.dll` + `SHA256SUMS.txt`
+- `upstream-reference-bridge-windows-x86_64` — the upstream reference bridge,
+  built from the pinned revision, as a known-good baseline
+
+Nothing from upstream is vendored into this repository: the workflow (and
+`scripts/bootstrap.ps1` for a local run) clones the pinned revision into
+`third_party/`, which is git-ignored and used as a path dependency for the
+`bridge_api` crate.
+
+The pinned revision is `b81f518831e89864a6391744cf9daa9eeadb3c51` — the commit
+the author's local `orender` reports as its build string (`b81f518-dirty`), so
+the plugin ABI matches the engine by construction.
+
+## Layout
+
+```
+crates/viola_bridge/       the plugin (cdylib)
+  src/lib.rs               root-module export (`format_bridge`)
+  src/bridge.rs            FormatBridge impl + label map
+  src/pcm.rs               sample encodings + streaming WAV header scanner
+scripts/bootstrap.ps1      fetch the pinned upstream bridge_api
+.github/workflows/build.yml
+```
+
+## Licence
+
+**GPL-3.0-or-later.** This plugin links `bridge_api`, which is GPL-3.0-or-later,
+so the combined work is GPL. It **must not** be linked into a proprietary
+program. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+The ASIO SDK is *not* used anywhere in this crate.
