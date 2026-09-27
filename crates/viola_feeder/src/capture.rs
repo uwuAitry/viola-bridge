@@ -87,9 +87,14 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
+    /// Open `device` and start capturing.
+    ///
+    /// The client is **always** initialised in the capture direction, even when
+    /// `device` came from the render collection: that is WASAPI's loopback rule.
+    /// Initialising a loopback stream with `Direction::Render` fails with
+    /// `AUDCLNT_E_WRONG_ENDPOINT_TYPE` (0x88890003) — measured, hence this note.
     pub(crate) fn open(
         device: &Device,
-        direction: &Direction,
         sample_rate: usize,
         channels: usize,
     ) -> Result<Self, String> {
@@ -101,7 +106,9 @@ impl Capture {
             autoconvert: true,
             buffer_duration_hns: min_hns,
         };
-        client.initialize_client(&format, direction, &mode).map_err(show)?;
+        client
+            .initialize_client(&format, &Direction::Capture, &mode)
+            .map_err(show)?;
         let event = client.set_get_eventhandle().map_err(show)?;
         let capture = client.get_audiocaptureclient().map_err(show)?;
         client.start_stream().map_err(show)?;

@@ -145,7 +145,7 @@ fn run() -> Result<(), String> {
     }
 
     let (device, direction) = capture::pick(args.device.as_deref(), args.loopback)?;
-    let mut capture = capture::Capture::open(&device, &direction, args.rate, args.channels)?;
+    let mut capture = capture::Capture::open(&device, args.rate, args.channels)?;
 
     let header = wav::streaming_header(args.rate as u32, args.channels as u16, 32);
     let mut sink = pipe::PipeWriter::new(args.pipe.clone());
