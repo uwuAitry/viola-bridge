@@ -4,8 +4,9 @@
 # Rust build output
 /target/
 
-# Local CI-artifact staging and probes
+# Local CI-artifact staging and probes (gh run download lands here; never commit binaries)
 /dist/
+/dist*/
 /probe/
 *.f32
 *.caf
