@@ -70,10 +70,13 @@ that order.
 
 ## Building in the cloud
 
-`.github/workflows/build.yml` runs on `windows-latest` and publishes two
+`.github/workflows/build.yml` runs on `windows-latest` and publishes four
 artifacts:
 
 - `viola-bridge-windows-x86_64` — `viola_bridge.dll` + `SHA256SUMS.txt`
+- `viola-feeder-windows-x86_64` — `viola_feeder.exe` + `SHA256SUMS.txt`
+- `viola-asio-windows-x86_64` — `viola_asio.dll` + `SHA256SUMS.txt`, the virtual
+  ASIO device; see [16-channel ASIO device (M5)](#16-channel-asio-device-m5)
 - `upstream-reference-bridge-windows-x86_64` — the upstream reference bridge,
   built from the pinned revision, as a known-good baseline
 
@@ -195,19 +198,96 @@ stereo, so this path carries 2 channels: it proves the *live chain*
 (DAW → virtual device → pipe → bridge → renderer), not 9.1.6's sixteen. Getting
 sixteen live channels needs one of the options in
 [docs/cloud-boundary.md §4](docs/cloud-boundary.md) — either the ASIO SDK at CI
-build time, or a multichannel virtual device. Both are currently **not** taken.
+build time, or a multichannel virtual device. **M5 takes the ASIO route**, in a
+separate driver rather than in the feeder: see
+[16-channel ASIO device (M5)](#16-channel-asio-device-m5) below. `viola_feeder`
+itself stays the 2-channel WASAPI path.
 
 See [docs/cloud-boundary.md](docs/cloud-boundary.md) for the rule that produced
 that choice.
 
+## 16-channel ASIO device (M5)
+
+`viola_asio.dll` is a virtual ASIO device that presents **16 inputs and 16
+outputs** to a DAW at 48 kHz (44.1 / 48 / 88.2 / 96 kHz accepted; 512-frame
+default buffer, 64–2048 accepted) — the sixteen channels M3's WASAPI capture
+could not carry.
+
+It **replaces the VB-Audio Matrix route** in
+[docs/cloud-boundary.md §4](docs/cloud-boundary.md): that option needs a
+third-party mixer installed on the operator machine, and every Windows-visible
+endpoint it offers still stops at 8 channels, so 16 channels would have to be
+reassembled from two captures. `viola_asio` is built entirely in CI, needs no
+other software installed, and hands the DAW's sixteen channels to the same
+`\\.\pipe\orender.input` that `viola_feeder` already streams into.
+
+The driver is a user-mode COM in-process server (`DllGetClassObject` /
+`DllCanUnloadNow`). The host finds it through the two registry locations that
+[docs/asio-driver-notes.md](docs/asio-driver-notes.md) records from the SDK's
+`common/register.cpp`. One fixed GUID is both the CLSID and the interface IID,
+and is written into the source rather than generated at install time.
+
+### Installing it
+
+CI publishes the artifact `viola-asio-windows-x86_64` (`viola_asio.dll` +
+`SHA256SUMS.txt`):
+
+```powershell
+gh run download --name viola-asio-windows-x86_64 --dir dist
+```
+
+Registration writes to `HKLM`, so it stays **the operator's decision** — nothing
+in CI and no unattended script does it. Both scripts are dry-run by default: they
+print every key and path they would touch, write nothing anywhere, create no
+directory, and never self-elevate. Only `-Apply` writes, and it needs an elevated
+prompt:
+
+```powershell
+pwsh -File scripts/register-asio.ps1            # preview: prints the plan
+pwsh -File scripts/register-asio.ps1 -Apply     # elevated: DLL + both registry keys
+pwsh -File scripts/unregister-asio.ps1          # preview: what would be removed
+pwsh -File scripts/unregister-asio.ps1 -Apply   # elevated: backs up to .reg, then removes
+```
+
+`register-asio.ps1` copies the DLL to `C:\ProgramData\viola-asio\` and writes
+exactly two locations:
+
+- `HKLM\SOFTWARE\Classes\CLSID\{6C1E7D94-3A52-4B8F-9E27-5D0B4C8A1F63}` — the
+  description as the key's default value, plus `InprocServer32` holding the
+  installed DLL path and `ThreadingModel = Apartment`
+- `HKLM\SOFTWARE\ASIO\viola-bridge ASIO` — `Description` and `CLSID`, both REG_SZ
+
+No other key is written. `unregister-asio.ps1` exports every key it is about to
+delete to a timestamped `.reg` file under `C:\ProgramData\viola-asio\` before
+deleting it, so the removal can be undone; the installed DLL is left on disk.
+
+### ASIO licensing notice
+
+This product displays **ASIO** together with the notice the Steinberg ASIO SDK
+licensing agreement requires:
+
+> **ASIO is a trademark and software of Steinberg Media Technologies GmbH**
+
+The SDK is fetched at build time inside CI (`scripts/fetch-asiosdk.ps1`); it is
+never committed to this repository and never redistributed in an artifact. The
+ASIO logo artwork ships inside the SDK (`Steinberg ASIO Logo Artwork.zip`) and is
+not committed here either. The authoritative 2023 licence revision (V2.0.3) has
+**not** been read yet — the obligations above are taken from an indicative plain
+text of V2.0.1, so they are unverified against the current terms. See
+[NOTICE](NOTICE).
+
 ## Layout
 
 ```
-crates/viola_bridge/       the plugin (cdylib)
-  src/lib.rs               root-module export (`format_bridge`)
-  src/bridge.rs            FormatBridge impl + label map
-  src/pcm.rs               sample encodings + streaming WAV header scanner
-scripts/bootstrap.ps1      fetch the pinned upstream bridge_api
+crates/viola_bridge/         the plugin (cdylib)
+  src/lib.rs                 root-module export (`format_bridge`)
+  src/bridge.rs              FormatBridge impl + label map
+  src/pcm.rs                 sample encodings + streaming WAV header scanner
+crates/viola_asio/           the virtual ASIO driver (cdylib, M5)
+scripts/bootstrap.ps1        fetch the pinned upstream bridge_api
+scripts/fetch-asiosdk.ps1    fetch the pinned ASIO SDK (build time only)
+scripts/register-asio.ps1    register the driver (dry run unless -Apply)
+scripts/unregister-asio.ps1  remove it, backing up to .reg first
 .github/workflows/build.yml
 ```
 
@@ -217,4 +297,7 @@ scripts/bootstrap.ps1      fetch the pinned upstream bridge_api
 so the combined work is GPL. It **must not** be linked into a proprietary
 program. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-The ASIO SDK is *not* used anywhere in this crate.
+The ASIO SDK is *not* used by `viola_bridge`; it is used by the separate
+`viola_asio` driver, which fetches it at build time in CI and never commits or
+redistributes it. See the [ASIO licensing
+notice](#asio-licensing-notice) and [NOTICE](NOTICE).

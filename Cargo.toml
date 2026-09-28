@@ -7,7 +7,7 @@
 # `scripts/bootstrap.ps1` at a pinned revision. See README.md § Layout.
 [workspace]
 resolver = "2"
-members = ["crates/viola_bridge", "crates/viola_feeder"]
+members = ["crates/viola_bridge", "crates/viola_feeder", "crates/viola_asio"]
 exclude = ["third_party"]
 
 [workspace.package]

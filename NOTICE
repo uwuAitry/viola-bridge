@@ -36,9 +36,32 @@ Third-party components
    label table differs (16-channel 9.1.6 support is added here).
 
 --------------------------------------------------------------------------------
-No ASIO SDK
+Steinberg ASIO SDK (used only by crates/viola_asio)
 --------------------------------------------------------------------------------
 
-This project does not use or redistribute the Steinberg ASIO SDK. Any ASIO
-capture component, if added later, will live in a separate crate/target and
-document its own licence obligations.
+crates/viola_asio implements a virtual ASIO device. It declares the ASIO driver
+interface (the 21-method IASIO vtable and the plain-C ASIO types) from the
+Steinberg ASIO SDK's headers; the SDK is not otherwise part of this work.
+
+  SDK      : Steinberg ASIO SDK 2.3.3
+  Fetched  : at build time inside CI, by scripts/fetch-asiosdk.ps1 (pinned URL
+             and SHA1, verified on download)
+  Status   : never committed to this repository (third_party/ is git-ignored) and
+             never redistributed. No SDK file is staged into any artifact: the
+             published artifact contains only viola_asio.dll + SHA256SUMS.txt.
+
+Notice required by the SDK licensing agreement (section 3). This product
+displays "ASIO" together with the following wording, here and in the product's
+own documentation:
+
+  "ASIO is a trademark and software of Steinberg Media Technologies GmbH"
+
+The ASIO logo artwork lives inside the SDK (Steinberg ASIO Logo Artwork.zip) and
+is not committed to this repository; the notice text above is displayed instead.
+
+NOT VERIFIED AGAINST THE CURRENT TERMS: the authoritative 2023 revision of the
+licensing agreement (V2.0.3 - 2023) has NOT been read yet. The notice wording and
+the obligations recorded here were taken from an indicative plain-text copy of
+V2.0.1 (2019), which is not the revision that ships with this SDK, so they are
+unconfirmed. Reading the V2.0.3 PDF and confirming that sections 2 and 3 did not
+change is still outstanding. See README.md, "ASIO licensing notice".

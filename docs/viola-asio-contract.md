@@ -28,7 +28,7 @@ passes it back to us as `riid`, so CLSID and IID must be the same value forever.
 | Setting | Default | Notes |
 |---|---|---|
 | Channels | **16 in / 16 out** | `ASIOGetChannels`; the point of the whole exercise |
-| Buffer size | 512 frames, min 64, max 2048, granularity 0 | `ASIOGetBufferSize` |
+| Buffer size | 512 frames, min 64, max 2048, granularity **-1** | `ASIOGetBufferSize`; asio.h reserves `0` for "min == max" and uses `-1` to mean "power-of-two sizes from min to max" |
 | Sample rate | 48000 | `ASIOGetSampleRate` / `canSampleRate` / `setSampleRate` accept 44100/48000/88200/96000 |
 | Pipe | `\\.\pipe\orender.input` | same destination `viola_feeder` already writes to |
 
