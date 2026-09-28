@@ -92,7 +92,6 @@ jobs:
           name: viola-feeder-windows-x86_64
           path: dist/
           if-no-files-found: error
-          if-no-files-found: error
 
   viola-asio:
     # NOTE: this job is expected to stay RED until the crates/viola_asio skeleton
