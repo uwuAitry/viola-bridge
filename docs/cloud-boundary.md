@@ -43,14 +43,46 @@ endpoint.
 
 ## 4. Open decision: how to reach 16 channels
 
+Status: the operator chose **(b)**, with the install itself still pending an
+explicit go-ahead.
+
 | Option | What it needs | Cost |
 |---|---|---|
-| **(a) Allow the ASIO SDK at CI build time** | a dependency that fetches the SDK inside the runner; SDK stays out of the repo and out of the artifacts | captures real ASIO devices directly; the SDK licence terms apply to the build |
-| **(b) Allow a multichannel virtual device** | installing VB-Audio Matrix (128×128) on the operator machine | the only option that also works through WASAPI; needs one install, which the boundary currently forbids |
+| **(a) Allow the ASIO SDK at CI build time** | a dependency that fetches the SDK inside the runner; the SDK stays out of the repo and out of the artifacts | captures real ASIO devices directly (any channel count); the SDK licence terms apply to the build |
+| **(b) Allow a multichannel virtual device** | installing VB-Audio Matrix on the operator machine | see the table below — **not sufficient on its own** |
 | **(c) Stay stereo** | nothing | no 9.1.6; live chain only |
 
-Until one is chosen, M3 targets (c).
+### What VB-Audio Matrix actually provides
 
+Facts taken from the vendor page (<https://vb-audio.com/Matrix/>, read
+2026-09-28). Package: `VBAudioMatrix_Setup_v1026.zip` (1.0.2.6, 15 MB),
+donationware (fully functional; after 30 days it invites a licence).
+
+The slot table matters more than its headline “680×680”:
+
+| Slot | Channels | Note |
+|---|---|---|
+| `ASIO128` (physical ASIO device) | 128×128 | needs an ASIO client to use it |
+| `VASIO8` / `VASIO64A` / `VASIO64B` (virtual ASIO) | 8 / 64 / 64 | 4× / 2× / 2× clients |
+| `VASIO128` (virtual ASIO) | 128×128 | **1 client** — the slot a DAW would use for 16 channels |
+| `VAIO1..4` (virtual WDM I/O) | 8×8 each | WDM/KS/MME/Direct-X, 1–8 channels |
+| `WIN1..4.IN/OUT` (Windows devices) | 8 each | |
+| `VBAN` streams | 4× 8ch + 1× 64ch | UDP, documented protocol |
+
+**The catch:** every Windows-visible path tops out at **8 channels**. A DAW can
+hand 16 channels to `VASIO128`, but WASAPI/VAIO endpoints stop at 8, so a
+WASAPI capture cannot see all 16 in one endpoint. That makes option (b) a
+prerequisite rather than a solution, and leaves three real ways to finish:
+
+1. **VBAN** — route the 16 channels into the Matrix's 64-channel VBAN stream and
+   write a small UDP receiver in the feeder. SDK-free and in the spirit of the
+   boundary; it is real work (the VBAN packet format plus jitter handling).
+2. **Two 8-channel VAIO captures** — split 16 channels across `VAIO1`+`VAIO2`
+   and reassemble in the feeder. SDK-free but the two endpoints are separate
+   WASAPI streams, so it needs sample-clock reconciliation.
+3. **The ASIO SDK** — i.e. option (a) again, now to capture `VASIO128` directly.
+
+Until one of those is chosen, the live path stays at M3's two channels.
 ## 5. How this is enforced
 
 - `.github/workflows/build.yml` is the only place that compiles anything.
