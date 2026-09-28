@@ -271,10 +271,13 @@ mod tests {
             (size_of::<ASIOTimeStamp>(), align_of::<ASIOTimeStamp>()),
             (8, 4)
         );
-        // Four 8-byte pointers at 4-byte alignment, not at 0/8/16/24.
+        // Four 8-byte pointers. `min(natural, 4)` is 4 either way, so they stay
+        // on 8-byte boundaries: 0/8/16/24, and the struct is 32 bytes. (The first
+        // draft of this test expected 16 bytes at 0/4/8/12 - that is the 32-bit
+        // layout, and CI caught it. See the task note about the MSVC ABI probe.)
         assert_eq!(
             (size_of::<ASIOCallbacks>(), align_of::<ASIOCallbacks>()),
-            (16, 4)
+            (32, 4)
         );
         // long, long, void*[2] → 4 + 4 + 16.
         assert_eq!(
@@ -312,13 +315,14 @@ mod tests {
 
     #[test]
     fn layout_matches_msvc_pack_4_offsets() {
-        // The four host callbacks sit 4 bytes apart, which is the single most
-        // dangerous consequence of the pack pragma.
+        // The callbacks are pointers, so packing does not move them off their
+        // natural 8-byte stride; the pack pragma only caps the *alignment* at 4,
+        // which costs nothing when the member is already 8 bytes wide.
         let callbacks: ASIOCallbacks = unsafe { core::mem::zeroed() };
         assert_eq!(offset_in!(callbacks, buffer_switch), 0);
-        assert_eq!(offset_in!(callbacks, sample_rate_did_change), 4);
-        assert_eq!(offset_in!(callbacks, asio_message), 8);
-        assert_eq!(offset_in!(callbacks, buffer_switch_time_info), 12);
+        assert_eq!(offset_in!(callbacks, sample_rate_did_change), 8);
+        assert_eq!(offset_in!(callbacks, asio_message), 16);
+        assert_eq!(offset_in!(callbacks, buffer_switch_time_info), 24);
 
         let infos: ASIOBufferInfo = unsafe { core::mem::zeroed() };
         assert_eq!(offset_in!(infos, is_input), 0);

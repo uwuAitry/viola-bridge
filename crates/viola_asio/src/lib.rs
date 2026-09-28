@@ -36,7 +36,10 @@
 mod driver;
 mod factory;
 mod ffi;
-mod guid;
+// `Guid` appears in the signature of the exported `DllGetClassObject`, so the
+// type has to be reachable from outside the crate; otherwise rustc warns
+// (`private_interfaces`) and the export's ABI reads as if it used a private type.
+pub mod guid;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};

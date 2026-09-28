@@ -31,11 +31,11 @@
 /// `docs/asio-driver-notes.md` §1).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq)]
-pub(crate) struct Guid {
-    pub(crate) data1: u32,
-    pub(crate) data2: u16,
-    pub(crate) data3: u16,
-    pub(crate) data4: [u8; 8],
+pub struct Guid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
 }
 
 impl Guid {

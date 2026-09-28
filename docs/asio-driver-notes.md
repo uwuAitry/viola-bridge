@@ -164,8 +164,12 @@ redistribute it, comply with §3 notices — is the one to take.
 
 * One fixed GUID, used as CLSID **and** IID; written into the source, not
   generated per install.
-* `viola_asio.dll` exports the five names above; the driver object implements the
-  21-method `IASIO` vtable plus `IUnknown`.
+* `viola_asio.dll` exports **two** names, not the sample's five:
+  `DllGetClassObject` and `DllCanUnloadNow`. `DllMain` belongs to the CRT (std
+  already provides it for an MSVC cdylib, so defining our own would be a duplicate
+  symbol), and `DllRegisterServer`/`DllUnregisterServer` are replaced by the
+  PowerShell scripts. The driver object implements the 21-method `IASIO` vtable
+  plus `IUnknown`.
 * Registration is done by `scripts/register-asio.ps1` (elevated), not by
   `DllRegisterServer` — easier to audit and to reverse.
 * The callback thread only ever `memcpy`s into a lock-free SPSC ring; a separate
@@ -174,3 +178,19 @@ redistribute it, comply with §3 notices — is the one to take.
   the SDK (`Steinberg ASIO Logo Artwork.zip`) and is **not** committed — the
   build/README point at the SDK copy, or we ship the notice text alone if the
   logo proves awkward inside a GPL repo.
+
+## 7. Follow-ups
+
+* **Independent ABI verification.** `crates/viola_asio/src/ffi.rs` mirrors the SDK
+  structs as `#[repr(C, packed(4))]` and pins every size and offset in a test. The
+  first draft of that test computed `ASIOCallbacks` as 16 bytes at 0/4/8/12 - the
+  32-bit layout - and CI caught it (the real layout is 32 bytes at 0/8/16/24). That
+  is a hand-computed expectation being checked against a hand-written mirror, so
+  the next rigour step is a probe compiled by **MSVC itself**
+  (`cl.exe` + the SDK's `asio.h`), printing `sizeof`/`alignof`/`offsetof`, and a CI
+  step that diffs its output against the Rust values. Two independent compilers
+  agreeing is proof; the current test is only a guard against drift.
+* **Export verification.** LNK4104 fires on the two exported names. The linker
+  still produces the DLL, but the export table should be read back from the built
+  artifact rather than assumed - a COM server whose `DllGetClassObject` is not
+  exported fails in a way that looks like a registration problem.

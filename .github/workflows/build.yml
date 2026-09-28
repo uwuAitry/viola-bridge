@@ -125,6 +125,13 @@ jobs:
         shell: pwsh
         run: cargo build --release -p viola_asio
 
+      # The workspace-wide `cargo test` lives in the viola_bridge job, but a
+      # failing crate should turn its own job red - without this step this job
+      # stayed green while viola_asio's tests were failing next door.
+      - name: Test the ASIO driver
+        shell: pwsh
+        run: cargo test --release -p viola_asio
+
       - name: Stage artifact + hashes
         shell: pwsh
         run: |
