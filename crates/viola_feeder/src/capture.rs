@@ -23,6 +23,14 @@ fn show<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Per-poll wait for the capture event, in milliseconds.
+const EVENT_TIMEOUT_MS: u32 = 2_000;
+
+/// How many consecutive fruitless polls (≈2 s each) before padding with
+/// silence. Measured: a WASAPI loopback stream simply stops delivering while
+/// the endpoint is silent, so this is normal, not an error.
+const IDLE_POLLS_BEFORE_SILENCE: u32 = 3;
+
 /// `(index, friendly name)` for every endpoint in `direction`.
 pub(crate) fn enumerate(direction: &Direction) -> Result<Vec<(u32, String)>, String> {
     let enumerator = DeviceEnumerator::new().map_err(show)?;
@@ -123,28 +131,48 @@ impl Capture {
 
     /// Block until `frames` interleaved sample-frames are buffered, then return
     /// exactly that many bytes.
-    pub(crate) fn read_frames(&mut self, frames: usize) -> Result<Vec<u8>, String> {
+    ///
+    /// A live feeder must not stall when the endpoint goes quiet: WASAPI
+    /// loopback delivers **no packets at all** while nothing is playing (and
+    /// `read_from_device_to_deque` still returns `Ok` with nothing added), so
+    /// after [`IDLE_POLLS_BEFORE_SILENCE`] fruitless polls this returns a chunk
+    /// of silence and flags it, keeping the renderer fed with a continuous
+    /// stream instead of spinning or dying.
+    pub(crate) fn read_frames(&mut self, frames: usize) -> Result<Chunk, String> {
         let want = frames * self.block_align;
         let mut idle = 0u32;
         while self.queue.len() < want {
-            if self.capture.read_from_device_to_deque(&mut self.queue).is_ok() {
+            let before = self.queue.len();
+            let read_ok = self.capture.read_from_device_to_deque(&mut self.queue).is_ok();
+            if read_ok && self.queue.len() > before {
                 idle = 0;
-            }
-            // A timeout is normal when nothing is playing; count consecutive
-            // ones so a dead endpoint is reported instead of hanging forever.
-            if self.event.wait_for_event(2000).is_err() {
+            } else {
                 idle += 1;
-                if idle >= 15 {
-                    return Err("no capture data for ~30 s (is the endpoint silent or gone?)".into());
+                if idle >= IDLE_POLLS_BEFORE_SILENCE {
+                    return Ok(Chunk {
+                        bytes: vec![0u8; want],
+                        synthetic: true,
+                    });
                 }
             }
+            let _ = self.event.wait_for_event(EVENT_TIMEOUT_MS);
         }
         let mut out = Vec::with_capacity(want);
         for _ in 0..want {
             out.push(self.queue.pop_front().expect("buffered above"));
         }
-        Ok(out)
+        Ok(Chunk {
+            bytes: out,
+            synthetic: false,
+        })
     }
+}
+
+/// One chunk handed to the pipe.
+pub(crate) struct Chunk {
+    pub(crate) bytes: Vec<u8>,
+    /// `true` when the endpoint was idle and this is padding.
+    pub(crate) synthetic: bool,
 }
 
 impl Drop for Capture {

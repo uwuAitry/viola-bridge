@@ -79,7 +79,10 @@ if (-not $NoTone) {
     $toneArgs = @(
         '-nodisp', '-autoexit', '-hide_banner', '-loglevel', 'error',
         '-volume', "$ToneVolume",
-        '-f', 'lavfi', '-i', "sine=frequency=$ToneHz:duration=$($Seconds + 2)"
+        # `${ToneHz}` must be braced: "$ToneHz:duration" parses as a variable
+        # literally named `ToneHz:duration`, which silently yields
+        # "sine=frequency==8" and the tone never plays.
+        '-f', 'lavfi', '-i', "sine=frequency=${ToneHz}:duration=$($Seconds + 2)"
     )
     $tone = Start-Process -FilePath 'ffplay' -ArgumentList $toneArgs `
         -RedirectStandardOutput $toneOut -RedirectStandardError $toneLog -PassThru
@@ -97,7 +100,12 @@ if ($Device) { $feederArgs += @('--device', $Device) }
 Write-Host "running the feeder for ${Seconds}s ..."
 # Start-Process must not be given the same path for both streams.
 $feeder = Start-Process -FilePath $FeederPath -ArgumentList $feederArgs `
-    -RedirectStandardOutput $feederOut -RedirectStandardError $feederLog -PassThru -Wait
+    -RedirectStandardOutput $feederOut -RedirectStandardError $feederLog -PassThru
+# Bounded wait: -Wait has hung on us before when the engine keeps the stream open.
+if (-not $feeder.WaitForExit(($Seconds + 30) * 1000)) {
+    $feeder.Kill()
+    Write-Warning 'the feeder did not exit in time; killed'
+}
 Write-Host '--- feeder output ---'
 Get-Content $feederOut, $feederLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
 

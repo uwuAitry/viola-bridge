@@ -159,6 +159,7 @@ fn run() -> Result<(), String> {
     let started = Instant::now();
     let mut connected = false;
     let mut chunks: u64 = 0;
+    let mut padding_reported = false;
     loop {
         if !connected {
             sink.connect(args.connect_timeout)?;
@@ -173,7 +174,17 @@ fn run() -> Result<(), String> {
         }
 
         let chunk = capture.read_frames(CHUNK_FRAMES)?;
-        match sink.write_all(&chunk) {
+        if chunk.synthetic {
+            if !padding_reported {
+                eprintln!(
+                    "viola_feeder: endpoint is idle; padding with silence so the stream stays continuous"
+                );
+                padding_reported = true;
+            }
+        } else {
+            padding_reported = false;
+        }
+        match sink.write_all(&chunk.bytes) {
             Ok(()) => {
                 chunks += 1;
                 if args.stats && chunks % 100 == 0 {
