@@ -19,6 +19,12 @@ use wasapi::{
     StreamMode, WaveFormat,
 };
 
+pub(crate) fn friendly_name(device: &Device) -> String {
+    device
+        .get_friendlyname()
+        .unwrap_or_else(|_| "<unknown endpoint>".to_string())
+}
+
 fn show<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }

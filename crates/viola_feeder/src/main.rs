@@ -145,12 +145,13 @@ fn run() -> Result<(), String> {
     }
 
     let (device, direction) = capture::pick(args.device.as_deref(), args.loopback)?;
+    let endpoint = capture::friendly_name(&device);
     let mut capture = capture::Capture::open(&device, args.rate, args.channels)?;
 
     let header = wav::streaming_header(args.rate as u32, args.channels as u16, 32);
     let mut sink = pipe::PipeWriter::new(args.pipe.clone());
     println!(
-        "capturing {direction:?} at {} ch / {} Hz -> {}",
+        "capturing {direction:?} \"{endpoint}\" at {} ch / {} Hz -> {}",
         args.channels,
         args.rate,
         sink.path().display()
