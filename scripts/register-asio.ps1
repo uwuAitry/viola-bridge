@@ -237,8 +237,25 @@ foreach ($entry in $plan) {
         Write-Host ('  would set        {0}  [{1}] = "{2}"' -f $entry.RegPath, $entry.Name, $entry.Value)
         continue
     }
-    if (-not $entry.KeyExists) { New-Item -Path $entry.Key -Force | Out-Null }
-    Set-ItemProperty -LiteralPath $entry.Key -Name $entry.Name -Value $entry.Value -Type String
+    # `reg.exe add` rather than New-Item + Set-ItemProperty. New-Item -Force on a
+    # registry key that already exists *recreates* it and drops the values already
+    # written to it, and KeyExists comes from the planning pass, so by the time the
+    # second entry for a key ran it was stale: the second New-Item wiped the first
+    # entry's value. Net effect was that only the last write per key survived -
+    # InprocServer32 lost its default (the DLL path!) and the ASIO key lost its
+    # Description. reg.exe add creates the path as needed, touches exactly one
+    # value, and reports an exit code we can check.
+    $regArgs = @('add', $entry.RegPath, '/f', '/t', 'REG_SZ', '/d', $entry.Value)
+    if ($entry.Name -eq '(default)') { $regArgs += '/ve' } else { $regArgs += @('/v', $entry.Name) }
+    $output = & reg.exe @regArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ('reg add failed for {0} [{1}] (exit {2}): {3}' -f $entry.RegPath, $entry.Name, $LASTEXITCODE, ($output -join ' '))
+    }
+    # Read it back: "the command exited 0" is not evidence that the value is there.
+    $back = Get-RegValue -KeyPath $entry.Key -Name $entry.Name
+    if ($back -ne $entry.Value) {
+        throw ('read-back mismatch for {0} [{1}]: expected "{2}", found "{3}"' -f $entry.RegPath, $entry.Name, $entry.Value, $back)
+    }
     $written++
     Write-Host ('  set              {0}  [{1}] = "{2}"' -f $entry.RegPath, $entry.Name, $entry.Value)
 }
