@@ -452,7 +452,7 @@ unsafe extern "system" fn asio_get_error_message(_this: *mut Driver, string: *mu
 ///
 /// Idempotent: starting an already-running driver is `ASE_OK`, not an error.
 unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
-    let Some(driver) = unsafe { driver_ref(this) } else {
+    let Some(driver) = (unsafe { driver_ref(this) }) else {
         return ASE_InvalidParameter;
     };
     let mut guard = driver.session.lock().unwrap_or_else(|error| error.into_inner());
@@ -545,7 +545,7 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
 /// and joins both threads before returning. Idempotent on purpose: hosts call it
 /// during teardown whether they started us or not, and that is `ASE_OK`.
 unsafe extern "system" fn asio_stop(this: *mut Driver) -> ASIOError {
-    let Some(driver) = unsafe { driver_ref(this) } else {
+    let Some(driver) = (unsafe { driver_ref(this) }) else {
         return ASE_InvalidParameter;
     };
     let mut guard = driver.session.lock().unwrap_or_else(|error| error.into_inner());
@@ -741,7 +741,7 @@ unsafe extern "system" fn asio_get_sample_position(
     s_pos: *mut ASIOSamples,
     t_stamp: *mut ASIOTimeStamp,
 ) -> ASIOError {
-    let Some(driver) = unsafe { driver_ref(this) } else {
+    let Some(driver) = (unsafe { driver_ref(this) }) else {
         return ASE_InvalidParameter;
     };
     if s_pos.is_null() || t_stamp.is_null() {
@@ -832,7 +832,7 @@ unsafe extern "system" fn asio_create_buffers(
     if num_channels > 2 * CHANNEL_COUNT {
         return ASE_InvalidParameter;
     }
-    let Some(driver) = unsafe { driver_ref(this) } else {
+    let Some(driver) = (unsafe { driver_ref(this) }) else {
         return ASE_InvalidParameter;
     };
 
@@ -872,7 +872,7 @@ unsafe extern "system" fn asio_create_buffers(
 /// returned." A running driver is stopped first, so that no `bufferSwitch` can
 /// still be on its way when the host frees its side of the arrangement.
 unsafe extern "system" fn asio_dispose_buffers(this: *mut Driver) -> ASIOError {
-    let Some(driver) = unsafe { driver_ref(this) } else {
+    let Some(driver) = (unsafe { driver_ref(this) }) else {
         return ASE_InvalidParameter;
     };
     let mut guard = driver.session.lock().unwrap_or_else(|error| error.into_inner());
@@ -922,7 +922,7 @@ unsafe extern "system" fn asio_future(
 /// uses this to know the driver is ready for the next block - so it answers
 /// `ASE_OK`, and before `start` it answers `ASE_NotPresent` as documented.
 unsafe extern "system" fn asio_output_ready(this: *mut Driver) -> ASIOError {
-    let Some(driver) = unsafe { driver_ref(this) } else {
+    let Some(driver) = (unsafe { driver_ref(this) }) else {
         return ASE_InvalidParameter;
     };
     let guard = driver.session.lock().unwrap_or_else(|error| error.into_inner());
