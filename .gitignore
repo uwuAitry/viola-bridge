@@ -8,5 +8,7 @@
 /dist/
 /dist*/
 /probe/
+# Machine-state snapshots taken by scripts/asio-state-snapshot.ps1
+/state-snapshots/
 *.f32
 *.caf
