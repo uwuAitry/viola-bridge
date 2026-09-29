@@ -149,6 +149,11 @@ pub(crate) struct ASIOTime {
 /// same struct); on `x86_64-pc-windows-msvc` — the only target this DLL is built
 /// for (`docs/viola-asio-contract.md`: `dist/viola-asio-windows-x86_64`) — that
 /// is the same convention as `extern "system"`.
+///
+/// `Copy` because the four function pointers are plain data and the driver has to
+/// keep its own copy of them for the lifetime of a `createBuffers` session; a
+/// type the host hands over by pointer and never takes back should be copyable.
+#[derive(Clone, Copy)]
 #[repr(C, packed(4))]
 pub(crate) struct ASIOCallbacks {
     /// `void (*bufferSwitch)(long doubleBufferIndex, ASIOBool directProcess)`
