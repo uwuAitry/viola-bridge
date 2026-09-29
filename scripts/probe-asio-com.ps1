@@ -26,6 +26,10 @@
 [CmdletBinding()]
 param(
     [string]$Clsid = '{6C1E7D94-3A52-4B8F-9E27-5D0B4C8A1F63}',
+    # Load this DLL directly instead of going through the COM registration, so a
+    # fresh build can be exercised before it is installed (installing needs an
+    # elevated shell, and finding out whether a build is broken should not).
+    [string]$DllPath,
     [int]$BufferSize = 512,
     # 16 in + 16 out, the bed the contract advertises.
     [int]$Channels = 32
@@ -150,6 +154,57 @@ public static class AsioComProbe {
 
     public static int ChannelInfoSampleType(IntPtr info) { return Marshal.ReadInt32(info, 16); }
     public static string ChannelInfoName(IntPtr info)    { return Marshal.PtrToStringAnsi(IntPtr.Add(info, 20)); }
+    // ---- direct loading, for testing a build before it is installed ---------
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr LoadLibraryW(string path);
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
+    static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    delegate int DllGetClassObjectD(IntPtr rclsid, IntPtr riid, out IntPtr ppv);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    delegate int CreateInstanceD(IntPtr self, IntPtr outer, IntPtr riid, out IntPtr ppv);
+
+    /// Does by hand what CLSCTX_INPROC_SERVER does through the registry:
+    /// LoadLibrary, DllGetClassObject, then the factory's CreateInstance with the
+    /// CLSID handed in as the interface IID - exactly what asiolist.cpp does.
+    public static IntPtr InstantiateFromDll(string dllPath, string clsid, ref string detail) {
+        IntPtr module = LoadLibraryW(dllPath);
+        if (module == IntPtr.Zero) {
+            detail = "LoadLibrary failed, win32 error " + Marshal.GetLastWin32Error();
+            return IntPtr.Zero;
+        }
+        IntPtr proc = GetProcAddress(module, "DllGetClassObject");
+        if (proc == IntPtr.Zero) {
+            detail = "the DLL does not export DllGetClassObject";
+            return IntPtr.Zero;
+        }
+
+        Guid clsidGuid = new Guid(clsid);
+        Guid iidClassFactory = new Guid("00000001-0000-0000-C000-000000000046");
+        IntPtr clsidPtr = Marshal.AllocHGlobal(16);
+        IntPtr iidPtr = Marshal.AllocHGlobal(16);
+        Marshal.StructureToPtr(clsidGuid, clsidPtr, false);
+        Marshal.StructureToPtr(iidClassFactory, iidPtr, false);
+
+        IntPtr factory;
+        var getClassObject = Marshal.GetDelegateForFunctionPointer<DllGetClassObjectD>(proc);
+        int hr = getClassObject(clsidPtr, iidPtr, out factory);
+        if (hr != 0 || factory == IntPtr.Zero) {
+            detail = string.Format("DllGetClassObject returned 0x{0:X8}", hr);
+            return IntPtr.Zero;
+        }
+
+        IntPtr instance;
+        var createInstance = Marshal.GetDelegateForFunctionPointer<CreateInstanceD>(Slot(factory, 3));
+        hr = createInstance(factory, IntPtr.Zero, clsidPtr, out instance);
+        if (hr != 0 || instance == IntPtr.Zero) {
+            detail = string.Format("IClassFactory::CreateInstance returned 0x{0:X8}", hr);
+            return IntPtr.Zero;
+        }
+        detail = string.Format("DllGetClassObject ok, CreateInstance ok (0x{0:X8})", hr);
+        return instance;
+    }
 
     public static string AsioError(int code) {
         if (code == 0) return "ASE_OK";
@@ -174,10 +229,20 @@ function Write-Line([string]$label, [string]$value) { Write-Host ("{0,-17}: {1}"
 
 $clsidGuid = [Guid]$Clsid
 $unknown   = [IntPtr]::Zero
-$hr = [AsioComProbe]::CoCreateInstance([ref]$clsidGuid, [IntPtr]::Zero, 1, [ref]$clsidGuid, [ref]$unknown)
-Write-Line 'CLSID' $Clsid
-Write-Line 'CoCreateInstance' ("0x{0:X8} {1}" -f $hr, $(if ($hr -eq 0) { '(S_OK)' } else { '(FAILED)' }))
-if ($hr -ne 0 -or $unknown -eq [IntPtr]::Zero) {
+$clsidGuid = [Guid]$Clsid
+$unknown   = [IntPtr]::Zero
+if ($DllPath) {
+    $detail = ''
+    $unknown = [AsioComProbe]::InstantiateFromDll($DllPath, $Clsid, [ref]$detail)
+    Write-Line 'CLSID' $Clsid
+    Write-Line 'LoadLibrary' $(if ($unknown -eq [IntPtr]::Zero) { "FAILED - $detail" } else { "direct load - $detail" })
+    if ($unknown -eq [IntPtr]::Zero) { exit 1 }
+} else {
+    $hr = [AsioComProbe]::CoCreateInstance([ref]$clsidGuid, [IntPtr]::Zero, 1, [ref]$clsidGuid, [ref]$unknown)
+    Write-Line 'CLSID' $Clsid
+    Write-Line 'CoCreateInstance' ("0x{0:X8} {1}" -f $hr, $(if ($hr -eq 0) { '(S_OK)' } else { '(FAILED)' }))
+}
+if ($unknown -eq [IntPtr]::Zero) {
     Write-Host ''
     Write-Host 'The driver could not be instantiated. Check, in this order:'
     Write-Host '  * HKLM\SOFTWARE\ASIO\<name> -> CLSID'
@@ -242,7 +307,10 @@ if ($rcCreate -eq 0) {
     # Only meaningful once the driver actually has buffers to switch.
     Write-Line 'start' (Format-Rc ([AsioComProbe]::CallStart($unknown)))
     Start-Sleep -Milliseconds 1500
-    Write-Line 'bufferSwitch' ("called {0} times in 1.5 s" -f [AsioComProbe]::SwitchCount)
+    # asio.h offers two ways to tell the host, and the driver prefers the
+    # time-info form when the host provided it, so both counters are reported:
+    # a bare "bufferSwitch: 0" would read like silence when the cadence is fine.
+    Write-Line 'bufferSwitch' ("called {0} times in 1.5 s (bufferSwitchTimeInfo: {1})" -f [AsioComProbe]::SwitchCount, [AsioComProbe]::TimeInfoCount)
     Write-Line 'stop' (Format-Rc ([AsioComProbe]::CallStop($unknown)))
     Write-Line 'disposeBuffers' (Format-Rc ([AsioComProbe]::CallDisposeBuffers($unknown)))
 } else {
