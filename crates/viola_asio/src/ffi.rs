@@ -35,7 +35,7 @@
 
 #![allow(non_camel_case_types)] // SDK spellings (ASIOBufferInfo, …) are kept verbatim
 #![allow(non_upper_case_globals)] // as are the error codes (ASE_NotPresent, …)
-#![allow(dead_code)] // the mirror is kept complete for M5.1b; not all of it is used yet
+#![allow(dead_code)] // the mirror is kept complete; not all of it is used yet
 
 use core::ffi::{c_char, c_void};
 

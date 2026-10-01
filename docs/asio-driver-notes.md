@@ -174,6 +174,38 @@ redistribute it, comply with §3 notices — is the one to take.
   `DllRegisterServer` — easier to audit and to reverse.
 * The callback thread only ever `memcpy`s into a lock-free SPSC ring; a separate
   thread writes the streaming-WAV bytes into `\\.\pipe\orender.input`.
+
+### How the buffered path is arranged, and why
+
+These are the choices M5.3 settles; the reasoning is worth keeping because each
+one looks like a mistake until the constraint behind it is stated.
+
+* **The driver is the pipe client, not the server.** `orender` creates
+  `\\.\pipe\orender.input` and waits for a client (`README.md`), so the driver
+  connects to it. A driver-owned pipe would have to exist before the engine
+  starts and would keep a stale instance around after the engine restarts;
+  connecting to the engine's pipe matches how `viola_feeder` already talks to it.
+* **The pipe thread is deliberately not joined by `stop()`.** The SDK promises
+  only that "on return from `ASIOStop()`, the driver must in no case call the
+  hosts' `bufferSwitch()` routine" (`common/asio.h`) — it does not promise the
+  driver has finished all its own work. Joining the writer inside `stop()` would
+  make a stalled reader (a frozen engine, a broken pipe) block the DAW's audio
+  thread for as long as the stall lasts. `stop()` therefore only stops the
+  producer; the writer's teardown must not depend on `stop()` waiting for it.
+* **A block that does not fit the ring is dropped, never overwrites.**
+  `write_block` is all-or-nothing against a power-of-two sample capacity with
+  roughly eight blocks of headroom (`crates/viola_asio/src/ring.rs`). Letting a
+  full ring overwrite the oldest samples would splice a discontinuity into audio
+  the reader is about to take; dropping the newest block instead keeps everything
+  the reader does get internally consistent, at the cost of a click. The count of
+  dropped blocks is in the log, so the click is diagnosable rather than silent.
+* **`directProcess` is passed as `ASIO_TRUE`.** The argument "suggests to the
+  host whether it should immedeately start processing (directProcess ==
+  ASIOTrue), or whether its process should be deferred because the call comes
+  from a very low level … and direct processing would cause timing instabilities"
+  (`common/asio.h`). This driver's callback is a plain thread wake, not interrupt
+  time, so the host may process immediately: `ASIO_TRUE` is accurate rather than
+  merely permissive.
 * Notices per §3 go into the README and `NOTICE`; the ASIO logo artwork comes from
   the SDK (`Steinberg ASIO Logo Artwork.zip`) and is **not** committed — the
   build/README point at the SDK copy, or we ship the notice text alone if the
@@ -194,3 +226,8 @@ redistribute it, comply with §3 notices — is the one to take.
   still produces the DLL, but the export table should be read back from the built
   artifact rather than assumed - a COM server whose `DllGetClassObject` is not
   exported fails in a way that looks like a registration problem.
+* **The `stop()` / writer-teardown handshake.** M5.3 leaves the pipe thread to
+  wind down on its own so that `stop()` cannot block the host (see §6). That is the
+  safe order, but it means a `start()` that follows a `stop()` while the old
+  writer is still draining needs a defined handshake; it is the first thing to
+  look at if a restart ever shows a stale header or a doubled ring backlog.

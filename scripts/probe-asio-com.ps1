@@ -21,6 +21,7 @@
 #
 #   pwsh -File scripts/probe-asio-com.ps1
 #   pwsh -File scripts/probe-asio-com.ps1 -Clsid '{...}' -BufferSize 512 -Channels 32
+#   pwsh -File scripts/probe-asio-com.ps1 -DllPath dist\viola-asio-windows-x86_64\viola_asio.dll -ToneHz 1000 -Seconds 3
 #
 # Does not need elevation: reading the COM registration is enough.
 [CmdletBinding()]
@@ -32,7 +33,13 @@ param(
     [string]$DllPath,
     [int]$BufferSize = 512,
     # 16 in + 16 out, the bed the contract advertises.
-    [int]$Channels = 32
+    [int]$Channels = 32,
+    # Play the DAW as well as probe it: write a distinct sine, base*(channel+1)
+    # Hz, into every driver output while the stream runs. 0 keeps the probe the
+    # read-only handshake the M5.2 verification uses.
+    [int]$ToneHz = 0,
+    # How long the driver is left to call back once it has been started.
+    [int]$Seconds = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -84,6 +91,8 @@ public static class AsioComProbe {
     static readonly AsioMessageD OnAsioMessage = (selector, value, message, opt) => 1;
     static readonly BufferSwitchTimeInfoD OnBufferSwitchTimeInfo = (parameters, index, direct) => {
         System.Threading.Interlocked.Increment(ref TimeInfoCount);
+        // Play the DAW: the driver reads this half back as soon as we return.
+        EmitTone(index);
         return IntPtr.Zero;
     };
 
@@ -111,6 +120,63 @@ public static class AsioComProbe {
     public static int  CallCreateBuffers(IntPtr p, IntPtr infos, int n, int size, IntPtr cb) { var d = Fn<CreateBuffersD>(p, 19); return d(p, infos, n, size, cb); }
     public static int  CallDisposeBuffers(IntPtr p)                               { var d = Fn<DisposeBuffersD>(p, 20); return d(p); }
     public static uint CallRelease(IntPtr p)                                      { var d = Fn<ReleaseD>(p, 2); return d(p); }
+
+    // ---- the DAW side: writing tone into the driver's output buffers ---------
+    // createBuffers overwrites the buffers[] we zeroed with the driver's own
+    // memory, so the pointers have to be read back from the very block we hand
+    // in. Each 24-byte ASIOBufferInfo holds two of them: buffers[0] at +8 and
+    // buffers[1] at +16 (common/asio.h). A host fills the half the driver names
+    // as the doubleBufferIndex.
+    public static bool ToneEnabled;
+    public static int  ToneFrames;
+    public static int  OutputCount;
+    // The probe sets the sample rate to 48000 unconditionally, and the contract
+    // fixes 48000 as well.
+    public const double ToneRate = 48000.0;
+
+    static IntPtr    toneInfos;
+    static float[][] toneBlocks;
+    static double[]  tonePhases;
+    static double[]  toneSteps;
+
+    /// Preallocates everything the callback needs, because the callback itself
+    /// must not allocate: a GC pause inside a DAW's audio thread is a dropout.
+    public static void EnableTone(IntPtr infos, int channels, int bufferSize, int baseHz) {
+        toneInfos   = infos;
+        ToneFrames  = bufferSize;
+        OutputCount = channels / 2;
+        toneBlocks  = new float[OutputCount][];
+        tonePhases  = new double[OutputCount];
+        toneSteps   = new double[OutputCount];
+        for (int o = 0; o < OutputCount; o++) {
+            toneBlocks[o] = new float[bufferSize];
+            tonePhases[o] = 0.0;
+            // Channel N gets base*(N+1) Hz, so the channels stay distinguishable
+            // even though analyze_raw_f32.py only reports per-channel levels.
+            toneSteps[o] = 2.0 * Math.PI * (baseHz * (o + 1)) / ToneRate;
+        }
+        ToneEnabled = true;
+    }
+
+    /// Fills and copies one block of every output channel. `index` is the half
+    /// the driver is about to have read back, so that is the half to write.
+    public static void EmitTone(int index) {
+        if (!ToneEnabled) return;
+        int half = index & 1;
+        for (int o = 0; o < OutputCount; o++) {
+            float[] block = toneBlocks[o];
+            double phase = tonePhases[o];
+            double step  = toneSteps[o];
+            for (int f = 0; f < ToneFrames; f++) {
+                block[f] = (float)(0.25 * Math.Sin(phase));
+                phase += step;
+            }
+            tonePhases[o] = phase % (2.0 * Math.PI);
+            // Entry 2o+1 is the o-th output; the builder interleaves input, output.
+            IntPtr dst = Marshal.ReadIntPtr(toneInfos, (2 * o + 1) * 24 + 8 + half * 8);
+            if (dst != IntPtr.Zero) Marshal.Copy(block, 0, dst, ToneFrames);
+        }
+    }
 
     // ASIOBufferInfo: 24 bytes under #pragma pack(4) - long isInput, long channelNum, void* buffers[2].
     public static IntPtr BuildBufferInfos(int channels) {
@@ -304,13 +370,19 @@ $rcCreate = [AsioComProbe]::CallCreateBuffers($unknown, $infos, $Channels, $Buff
 Write-Line 'createBuffers' ("rc={0}  ({1} channels, {2} frames)" -f (Format-Rc $rcCreate), $Channels, $BufferSize)
 
 if ($rcCreate -eq 0) {
+    if ($ToneHz -gt 0) {
+        # The driver filled buffers[0]/buffers[1] in during createBuffers, so the
+        # pointers the callbacks write through are read back from that same block.
+        [AsioComProbe]::EnableTone($infos, $Channels, $BufferSize, $ToneHz)
+        Write-Line 'tone' ("{0} Hz base on {1} output channels, {2} Hz" -f $ToneHz, [AsioComProbe]::OutputCount, [AsioComProbe]::ToneRate)
+    }
     # Only meaningful once the driver actually has buffers to switch.
     Write-Line 'start' (Format-Rc ([AsioComProbe]::CallStart($unknown)))
-    Start-Sleep -Milliseconds 1500
+    Start-Sleep -Seconds $Seconds
     # asio.h offers two ways to tell the host, and the driver prefers the
     # time-info form when the host provided it, so both counters are reported:
     # a bare "bufferSwitch: 0" would read like silence when the cadence is fine.
-    Write-Line 'bufferSwitch' ("called {0} times in 1.5 s (bufferSwitchTimeInfo: {1})" -f [AsioComProbe]::SwitchCount, [AsioComProbe]::TimeInfoCount)
+    Write-Line 'bufferSwitch' ("called {0} times in {1} s (bufferSwitchTimeInfo: {2})" -f [AsioComProbe]::SwitchCount, $Seconds, [AsioComProbe]::TimeInfoCount)
     Write-Line 'stop' (Format-Rc ([AsioComProbe]::CallStop($unknown)))
     Write-Line 'disposeBuffers' (Format-Rc ([AsioComProbe]::CallDisposeBuffers($unknown)))
 } else {

@@ -34,22 +34,29 @@ installed on any machine to make this work.
 
 **Consequence, stated plainly:** the WDM side of a virtual audio device is
 stereo. So M3 can prove the *live chain* (DAW → virtual device → pipe → bridge →
-renderer) but not 9.1.6's sixteen channels. Sixteen channels needs one of the
-decisions in §4.
+renderer) but not 9.1.6's sixteen channels. Sixteen channels needs the decision
+recorded in §4.
 
 The ASIO hop is still in the signal path when Studio One outputs to a virtual
 ASIO driver — the capture simply happens one step later, on the device's WDM
 endpoint.
 
-## 4. Open decision: how to reach 16 channels
+## 4. Decision: how to reach 16 channels (settled by M5)
 
-Status: the operator chose **(b)**, with the install itself still pending an
-explicit go-ahead.
+The operator first chose **(b)**, a multichannel virtual device. **M5 supersedes
+that route.** Of the three options, **(a) is what actually shipped**: the CI
+build fetches the ASIO SDK and compiles `viola_asio`, a virtual ASIO driver that
+presents 16 outputs to the DAW and hands them to the same
+`\\.\pipe\orender.input` the rest of the chain already uses. No third-party
+mixer is installed, and nothing but the finished DLL reaches the operator
+machine.
 
+The table and the VB-Audio analysis below are kept as the record of why the
+virtual-device route was considered and dropped, not as the plan.
 | Option | What it needs | Cost |
 |---|---|---|
-| **(a) Allow the ASIO SDK at CI build time** | a dependency that fetches the SDK inside the runner; the SDK stays out of the repo and out of the artifacts | captures real ASIO devices directly (any channel count); the SDK licence terms apply to the build |
-| **(b) Allow a multichannel virtual device** | installing VB-Audio Matrix on the operator machine | see the table below — **not sufficient on its own** |
+| **(a) Allow the ASIO SDK at CI build time** — **this is what shipped, in M5** | a dependency that fetches the SDK inside the runner; the SDK stays out of the repo and out of the artifacts | captures real ASIO devices directly (any channel count); the SDK licence terms apply to the build |
+| **(b) Allow a multichannel virtual device** — *superseded by M5* | installing VB-Audio Matrix on the operator machine | see the table below — **not sufficient on its own** |
 | **(c) Stay stereo** | nothing | no 9.1.6; live chain only |
 
 ### What VB-Audio Matrix actually provides
@@ -71,9 +78,8 @@ The slot table matters more than its headline “680×680”:
 
 **The catch:** every Windows-visible path tops out at **8 channels**. A DAW can
 hand 16 channels to `VASIO128`, but WASAPI/VAIO endpoints stop at 8, so a
-WASAPI capture cannot see all 16 in one endpoint. That makes option (b) a
-prerequisite rather than a solution, and leaves three real ways to finish:
-
+WASAPI capture cannot see all 16 in one endpoint. That made option (b) a
+prerequisite rather than a solution, and left three real ways to finish:
 1. **VBAN** — route the 16 channels into the Matrix's 64-channel VBAN stream and
    write a small UDP receiver in the feeder. SDK-free and in the spirit of the
    boundary; it is real work (the VBAN packet format plus jitter handling).
@@ -82,7 +88,11 @@ prerequisite rather than a solution, and leaves three real ways to finish:
    WASAPI streams, so it needs sample-clock reconciliation.
 3. **The ASIO SDK** — i.e. option (a) again, now to capture `VASIO128` directly.
 
-Until one of those is chosen, the live path stays at M3's two channels.
+M5 therefore took the **(a)** route to its natural end: rather than fetching the
+SDK to *capture* another vendor's device through WASAPI, CI compiles our own ASIO
+driver against the SDK. Option (b), and the three sub-routes it would have
+needed, are dead.
+
 ## 5. How this is enforced
 
 - `.github/workflows/build.yml` is the only place that compiles anything.

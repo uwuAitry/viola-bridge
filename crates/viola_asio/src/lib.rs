@@ -27,8 +27,10 @@
 //!
 //! Module layout is the one the contract fixes: [`guid`] (the single fixed GUID),
 //! [`ffi`] (the plain-C type mirrors), [`driver`] (the 21-method `IASIO` vtable),
-//! [`factory`] (`IClassFactory`), and this file (the COM entry points plus the
-//! contract's numeric defaults, so both halves read the same literals).
+//! [`factory`] (`IClassFactory`), [`ring`]/[`pipe`] (the M5.3 audio path's lock-free
+//! ring and the thread that drains it into the engine), and this file (the COM
+//! entry points plus the contract's numeric defaults, so both halves read the
+//! same literals).
 //!
 //! Nothing on a host-controlled path allocates or panics: this code runs inside
 //! the DAW's process, so a bug of ours is a crash of theirs.
@@ -36,6 +38,10 @@
 mod driver;
 mod factory;
 mod ffi;
+// The M5.3 audio path: the ring the ticker fills (`ring`) and the pipe thread that
+// drains it into orender (`pipe`).
+mod pipe;
+mod ring;
 // `Guid` appears in the signature of the exported `DllGetClassObject`, so the
 // type has to be reachable from outside the crate; otherwise rustc warns
 // (`private_interfaces`) and the export's ABI reads as if it used a private type.
@@ -77,12 +83,9 @@ pub(crate) const MAX_BUFFER_SIZE: i32 = 2048;
 pub(crate) const DEFAULT_BUFFER_SIZE: i32 = 512;
 pub(crate) const BUFFER_SIZE_GRANULARITY: i32 = -1;
 
-/// Where the buffer thread will stream the channel bed once M5.1b implements
-/// `createBuffers`: the same named pipe `viola_feeder` already writes to
-/// (`docs/viola-asio-contract.md`). Not referenced by any code yet — it is kept
-/// here so the destination lives with the other contract defaults instead of
-/// being re-typed from memory later.
-#[allow(dead_code)]
+/// Where the pipe thread streams the interleaved channel bed: the same named pipe
+/// `viola_feeder` already writes to (`docs/viola-asio-contract.md`). The driver is
+/// the client; orender creates the pipe and waits.
 pub(crate) const PIPE_PATH: &str = r"\\.\pipe\orender.input";
 
 /// COM objects handed out and not yet released — factories and drivers both.

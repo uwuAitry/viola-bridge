@@ -28,13 +28,15 @@
 //! pointer without checking it first: the DLL runs inside the host's process, so
 //! a bug of ours is the DAW's crash.
 //!
-//! Status of this revision (M5.1a): the static facts are answered (channel
-//! count, buffer window, sample rate, clock source) and everything that needs
-//! buffers, a clock thread, or host memory is still a stub that reports an
-//! error. `createBuffers`/`disposeBuffers`/`start` report `ASE_InvalidMode`
-//! rather than `ASE_NotPresent`, because `getChannels` has already told the host
-//! that the device is present; asio.h documents `ASE_InvalidMode` for exactly
-//! the "no buffers were ever prepared / used in a bad mode" case.
+//! Status of this revision (M5.3): the static facts are answered, the double
+//! buffers are real memory, and a high-resolution waitable timer drives the
+//! host's `bufferSwitch` cadence. Each tick also lifts the half the host has
+//! just finished writing out of its output buffers, interleaves the active
+//! channels, and pushes the block onto a lock-free ring. A third thread drains
+//! that ring into `\.\pipe\orender.input`, where `orender` is already waiting.
+//!
+//! The input buffers stay silent on purpose: a host *reads* those, and M5.3 only
+//! carries what a host plays into us.
 
 use core::ffi::{c_char, c_void};
 use core::ptr;
@@ -53,9 +55,11 @@ use crate::ffi::{
     S_OK,
 };
 use crate::guid::{guid_ref, Guid, CLSID_VIOLA_ASIO, IID_IUNKNOWN};
+use crate::pipe::{pipe_loop, Pipeline};
+use crate::ring::Tap;
 use crate::{
     rate_is_supported, DEFAULT_BUFFER_SIZE, DEFAULT_SAMPLE_RATE, DRIVER_NAME, LIVE_OBJECTS,
-    MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, BUFFER_SIZE_GRANULARITY, CHANNEL_COUNT,
+    MAX_BUFFER_SIZE, MIN_BUFFER_SIZE, BUFFER_SIZE_GRANULARITY, CHANNEL_COUNT, PIPE_PATH,
 };
 
 /// `getDriverName` writes into `ASIODriverInfo.name[32]` (asio.h).
@@ -69,10 +73,10 @@ const ASIO_CLOCK_SOURCE_NAME_CAP: usize = 32;
 const INTERNAL_CLOCK_NAME: &str = "Internal";
 /// `getDriverVersion` is "driver specific" (asio.h). Revision 1 of this driver.
 const DRIVER_VERSION: i32 = 1;
-/// What `getErrorMessage` reports until M5.1b has real failures to report.
-/// asio.h: the string should describe "the type of error that occured during
-/// ASIOInit()".
-const SKELETON_MESSAGE: &str = "viola-bridge ASIO: skeleton driver, audio I/O not implemented yet";
+/// What `getErrorMessage` reports. asio.h: the string should describe "the type
+/// of error that occured during ASIOInit()", and this revision has none to
+/// report, so it says so rather than claiming a stub that no longer exists.
+const NO_ERROR_MESSAGE: &str = "viola-bridge ASIO: no error";
 
 /// `ASIOChannelInfo.name[32]` (asio.h).
 const ASIO_CHANNEL_NAME_CAP: usize = 32;
@@ -117,6 +121,22 @@ unsafe extern "system" {
     fn GetCurrentThread() -> *mut c_void;
     fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
     fn GetSystemTimeAsFileTime(out: *mut u64);
+    fn GetLocalTime(out: *mut LocalSystemTime);
+}
+
+/// `SYSTEMTIME` (minwinbase.h), the layout `GetLocalTime` fills in. Only used to
+/// stamp the log line with local wall-clock time, so it can be lined up against
+/// orender's own log; the audio path never reads it.
+#[repr(C)]
+struct LocalSystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
 }
 
 /// A Win32 handle that is moved into the thread owning it. The raw pointer is not
@@ -126,7 +146,8 @@ unsafe extern "system" {
 struct WinHandle(*mut c_void);
 unsafe impl Send for WinHandle {}
 
-/// What the timer thread and the logger thread share with the object.
+/// What the timer thread, the logger thread and the pipe thread share with the
+/// object.
 ///
 /// The audio path reads only atomics and immutable fields: no lock, no
 /// allocation, no I/O. Everything that can block lives in the control methods,
@@ -147,6 +168,12 @@ struct Tick {
     /// The worst gap between two consecutive ticks, in ns. This is the number
     /// that says whether the timer is good enough to feed the pipe.
     worst_gap_ns: AtomicU64,
+    /// Lifts one finished half out of the host's output buffers, interleaved. The
+    /// ticker owns the only copy of it, so `fill` is only ever called here.
+    tap: Tap,
+    /// The ring the ticker pushes each finished block onto, and the counters the
+    /// log line reports. The audio path only ever calls `write_block` on it.
+    pipeline: Arc<Pipeline>,
 }
 
 /// The state between `createBuffers` and `disposeBuffers`.
@@ -158,6 +185,11 @@ struct Session {
     buffer_size: i32,
     callbacks: ASIOCallbacks,
     running: Option<Running>,
+    /// `buffers[0]` of every output channel the host activated, indexed by the
+    /// host's own `channelNum`; null where it left a channel inactive. Captured
+    /// in `createBuffers`, read every tick, and only ever read - the host owns
+    /// the memory and frees it in `disposeBuffers`, which stops the ticker first.
+    outputs: [*const f32; CHANNEL_COUNT as usize],
 }
 
 /// The live timer: shared counters plus the threads that own the handle.
@@ -167,6 +199,9 @@ struct Running {
     stop: Arc<AtomicU32>,
     ticker: Option<JoinHandle<()>>,
     logger: Option<JoinHandle<()>>,
+    /// The pipe thread's handle. Owned here so the thread belongs to this state,
+    /// but deliberately never joined: see `shutdown`.
+    pipe: Option<JoinHandle<()>>,
 }
 
 /// The `IASIO` vtable: 3 `IUnknown` slots, then the 21 ASIO slots of
@@ -414,7 +449,7 @@ pub(crate) unsafe extern "system" fn driver_release(this: *mut Driver) -> u32 {
 ///
 /// `ASIOTrue` means accepted. `sysHandle` is the host's main window handle
 /// (`ASIODriverInfo.sysRef`, asio.h) and may legitimately be null, so it is not
-/// inspected. M5.1b will start the timer thread from here.
+/// inspected. The timer thread is started by `start`, not from here.
 unsafe extern "system" fn asio_init(_this: *mut Driver, _sys_handle: *mut c_void) -> ASIOBool {
     ASIO_TRUE
 }
@@ -439,7 +474,7 @@ unsafe extern "system" fn asio_get_driver_version(_this: *mut Driver) -> i32 {
 ///
 /// The host passes the `char errorMessage[124]` of its `ASIODriverInfo`.
 unsafe extern "system" fn asio_get_error_message(_this: *mut Driver, string: *mut c_char) {
-    unsafe { write_cstr(string, SKELETON_MESSAGE, ASIO_ERROR_MESSAGE_CAP) };
+    unsafe { write_cstr(string, NO_ERROR_MESSAGE, ASIO_ERROR_MESSAGE_CAP) };
 }
 
 /// `start()` — 4.
@@ -481,6 +516,14 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
         return ASE_HWMalfunction;
     }
 
+    // Eight blocks of headroom, rounded up to a power of two: the ring's whole
+    // point is to ride out a scheduling hiccup on either side without dropping
+    // audio. `block_samples` is interleaved samples, which is what the ring counts.
+    let block_samples = session.buffer_size as usize * CHANNEL_COUNT as usize;
+    let capacity = block_samples.next_power_of_two() * 8;
+    let pipeline = Arc::new(Pipeline::new(capacity));
+    let tap = Tap::new(session.outputs, session.buffer_size as usize);
+
     let shared = Arc::new(Tick {
         callbacks: session.callbacks,
         buffer_size: session.buffer_size,
@@ -491,6 +534,8 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
         callbacks_served: AtomicU64::new(0),
         last_tick_ns: AtomicU64::new(0),
         worst_gap_ns: AtomicU64::new(0),
+        tap,
+        pipeline: Arc::clone(&pipeline),
     });
     let stop = Arc::new(AtomicU32::new(0));
     let handle = WinHandle(timer);
@@ -510,10 +555,19 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
             .spawn(move || log_loop(shared, stop))
     };
 
-    let (ticker, logger) = match (ticker, logger) {
-        (Ok(ticker), Ok(logger)) => (ticker, logger),
-        (ticker, logger) => {
-            // One of the two threads did not start. Wind everything down before
+    let pipe = {
+        let pipeline = Arc::clone(&pipeline);
+        let stop = Arc::clone(&stop);
+        let pipeline_rate = sample_rate as u32;
+        thread::Builder::new()
+            .name("viola-asio pipe".to_string())
+            .spawn(move || pipe_loop(pipeline, stop, PathBuf::from(PIPE_PATH), pipeline_rate))
+    };
+
+    let (ticker, logger, pipe) = match (ticker, logger, pipe) {
+        (Ok(ticker), Ok(logger), Ok(pipe)) => (ticker, logger, pipe),
+        (ticker, logger, pipe) => {
+            // One of the threads did not start. Wind everything down before
             // reporting, so we never leak a timer that nothing waits on.
             stop.store(1, Ordering::Release);
             if let Ok(ticker) = ticker {
@@ -523,6 +577,9 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
             if let Ok(logger) = logger {
                 let _ = logger.join();
             }
+            // Not joined, for the same reason `shutdown` does not join it: a writer
+            // stalled on a named pipe must never be able to block this call.
+            drop(pipe);
             unsafe { CloseHandle(timer) };
             return ASE_HWMalfunction;
         }
@@ -534,6 +591,7 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
         stop,
         ticker: Some(ticker),
         logger: Some(logger),
+        pipe: Some(pipe),
     });
     ASE_OK
 }
@@ -542,7 +600,10 @@ unsafe extern "system" fn asio_start(this: *mut Driver) -> ASIOError {
 ///
 /// asio.h only constrains `stop()` by requiring that no `bufferSwitch` is called
 /// after it returns, so this signals the timer thread, wakes it out of its wait
-/// and joins both threads before returning. Idempotent on purpose: hosts call it
+/// and joins the timer thread before returning. The pipe thread is not joined
+/// (see `Running::shutdown`) but it watches the same `stop` flag and leaves on its
+/// own, so this still returns promptly even if the pipe's reader has stalled.
+/// Idempotent on purpose: hosts call it
 /// during teardown whether they started us or not, and that is `ASE_OK`.
 unsafe extern "system" fn asio_stop(this: *mut Driver) -> ASIOError {
     let Some(driver) = (unsafe { driver_ref(this) }) else {
@@ -599,7 +660,7 @@ unsafe extern "system" fn asio_get_latencies(
 /// from minSize to maxSize" case and reserves `0` for "minimum and maximum buffer
 /// size are equal", which is not our case. The value below is what
 /// `docs/viola-asio-contract.md` freezes, so it is not changed silently — it is
-/// flagged for review in the M5.1a handover instead.
+/// flagged for review in a later revision instead.
 unsafe extern "system" fn asio_get_buffer_size(
     _this: *mut Driver,
     min_size: *mut i32,
@@ -810,10 +871,12 @@ unsafe extern "system" fn asio_get_channel_info(
 /// `createBuffers(ASIOBufferInfo *bufferInfos, long numChannels, long bufferSize, ASIOCallbacks *callbacks)` — 16.
 ///
 /// The buffer handshake: the host hands over one `ASIOBufferInfo` per channel
-/// and the four callbacks, and the driver is expected to fill in the two halves
-/// of each double buffer. That allocation is M5.1b, so a well-formed call is
-/// answered with `ASE_InvalidMode` ("used in a bad mode") rather than
-/// `ASE_NotPresent`, which would contradict the 16/16 that `getChannels` reports.
+/// and the four callbacks, and the driver must fill in the two halves of each
+/// double buffer. Every channel of the handshake gets real memory. The host's
+/// `channelNum` is range-checked because it indexes our own 16-slot tables, and
+/// the output channels' `buffers[0]` pointers are captured for `Tap` to read
+/// once `start` has put a timer thread on them. The input channels stay silent:
+/// a host *reads* those, and M5.3 only carries what a host plays into us.
 unsafe extern "system" fn asio_create_buffers(
     this: *mut Driver,
     buffer_infos: *mut ASIOBufferInfo,
@@ -844,16 +907,51 @@ unsafe extern "system" fn asio_create_buffers(
         return ASE_InvalidMode;
     }
 
+    // `channelNum` indexes the 16-slot table below, so it is range-checked before
+    // any pointer is handed out: a host that names a channel outside 0..16 would
+    // otherwise write past the end of it. A repeat is refused too - two entries
+    // claiming one slot would silently drop one of them. asio.h numbers inputs and
+    // outputs in their own spaces, so the check is per direction. It runs on its
+    // own pass so a rejected handshake leaves every `buffers` entry exactly as the
+    // host passed it.
+    let mut seen = [false; 2 * CHANNEL_COUNT as usize];
+    for index in 0..num_channels as usize {
+        let info = unsafe { &*buffer_infos.add(index) };
+        // Read by value: `ASIOBufferInfo` is a `packed(4)` mirror and a borrow of
+        // one of its fields would be a reference to a packed field, which Rust
+        // refuses outright.
+        let is_input = info.is_input;
+        let channel_num = info.channel_num;
+        if !(0..CHANNEL_COUNT).contains(&channel_num) {
+            return ASE_InvalidParameter;
+        }
+        // `is_input` is an `ASIOBool` long, so normalise it rather than trusting
+        // the host to have sent exactly 0 or 1.
+        let slot = (if is_input == ASIO_FALSE { 0 } else { CHANNEL_COUNT }) as usize
+            + channel_num as usize;
+        if seen[slot] {
+            return ASE_InvalidParameter;
+        }
+        seen[slot] = true;
+    }
+
+    let mut outputs: [*const f32; CHANNEL_COUNT as usize] = [ptr::null(); CHANNEL_COUNT as usize];
     let mut blocks: Vec<Box<[f32]>> = Vec::with_capacity(num_channels as usize);
     for index in 0..num_channels as usize {
         let info = unsafe { &mut *buffer_infos.add(index) };
-        // Both directions get real memory: the host reads the input buffers and
-        // writes the output buffers, and until M5.3 connects either to anything
-        // they simply stay silent.
+        // Both directions get real memory: a host reads the input buffers and
+        // writes the output buffers. The output halves are the ones `Tap` lifts
+        // once `start` runs. The input halves are filled by nobody, so a host that
+        // reads them hears silence.
         let mut block = vec![0.0_f32; 2 * buffer_size as usize].into_boxed_slice();
         let base = block.as_mut_ptr();
         info.buffers[0] = base.cast::<c_void>();
         info.buffers[1] = unsafe { base.add(buffer_size as usize) }.cast::<c_void>();
+        let is_input = info.is_input;
+        let channel_num = info.channel_num;
+        if is_input == ASIO_FALSE {
+            outputs[channel_num as usize] = base as *const f32;
+        }
         blocks.push(block);
     }
 
@@ -862,6 +960,7 @@ unsafe extern "system" fn asio_create_buffers(
         buffer_size,
         callbacks,
         running: None,
+        outputs,
     });
     ASE_OK
 }
@@ -1035,6 +1134,27 @@ fn append_log(line: &str) {
     }
 }
 
+/// Local wall-clock time for the log line, from `GetLocalTime` (minwinbase.h).
+/// Formatted by hand - this crate has no date library, and the log is the only
+/// place the driver's timeline can be lined up against orender's.
+fn local_timestamp() -> String {
+    let mut raw = LocalSystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut raw) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        raw.year, raw.month, raw.day, raw.hour, raw.minute, raw.second, raw.milliseconds
+    )
+}
+
 /// The logger thread. It wakes in small slices so that `stop()` is not stuck for
 /// a whole interval, and writes one line per `LOG_INTERVAL`.
 fn log_loop(shared: Arc<Tick>, stop: Arc<AtomicU32>) {
@@ -1050,13 +1170,19 @@ fn log_loop(shared: Arc<Tick>, stop: Arc<AtomicU32>) {
         }
         let served = shared.callbacks_served.load(Ordering::Acquire);
         let line = format!(
-            "callbacks=+{} total={} position={} worst_gap_ms={:.3} buffer_frames={} rate={:.0}\n",
+            "{} callbacks=+{} total={} position={} worst_gap_ms={:.3} buffer_frames={} rate={:.0} ring={}/{} dropped={} written={} connected={}\n",
+            local_timestamp(),
             served.saturating_sub(previous_served),
             served,
             shared.position.load(Ordering::Acquire),
             shared.worst_gap_ns.load(Ordering::Acquire) as f64 / 1_000_000.0,
             shared.buffer_size,
             shared.sample_rate,
+            shared.pipeline.ring.len(),
+            shared.pipeline.ring.capacity(),
+            shared.pipeline.dropped_blocks.load(Ordering::Acquire),
+            shared.pipeline.samples_written.load(Ordering::Acquire),
+            shared.pipeline.connected.load(Ordering::Acquire),
         );
         previous_served = served;
         append_log(&line);
@@ -1081,6 +1207,19 @@ impl Tick {
         let position = self.position.fetch_add(self.buffer_size as u64, Ordering::AcqRel);
         self.callbacks_served.fetch_add(1, Ordering::AcqRel);
 
+        // The half the host has just finished writing is `index ^ 1`: asio.h says
+        // `index` is the buffer it is *about to fill*. `half` is that half's frame
+        // offset inside `buffers[0]`, which is what `Tap` takes. This happens
+        // before the host is called back, so the block on the wire is the one it
+        // just finished - not the one it is filling now.
+        let half = (index ^ 1) as usize * self.buffer_size as usize;
+        let block = self.tap.fill(half);
+        if !self.pipeline.ring.write_block(block) {
+            // The ring is full, so a reader is behind. Dropping this block is the
+            // documented policy: overwriting unread audio would corrupt the stream
+            // instead of losing a slice of it. The count is what makes that visible.
+            self.pipeline.dropped_blocks.fetch_add(1, Ordering::Release);
+        }
         // asio.h documents two ways to tell the host, and the SDK sample prefers
         // the time-info form when the host offered it.
         if let Some(time_info) = self.callbacks.buffer_switch_time_info {
@@ -1126,6 +1265,12 @@ impl Running {
         if let Some(logger) = self.logger {
             let _ = logger.join();
         }
+        // `self.pipe` is deliberately dropped here, never joined. asio.h's `stop()`
+        // promises the host that no callback is still in flight, and the timer
+        // thread is what calls back; the pipe thread only writes to a named pipe,
+        // and joining it could block this call forever if the reader has stalled -
+        // which would hang the DAW. It sees `stop` and exits on its own.
+        let _ = self.pipe;
         unsafe { CloseHandle(self.handle.0) };
     }
 }
@@ -1335,8 +1480,8 @@ mod tests {
             let mut buf = [0x7Fu8; 124];
             unsafe { asio_get_error_message(driver, buf.as_mut_ptr() as *mut c_char) };
             assert_ne!(buf[0], 0);
-            assert_eq!(buf[SKELETON_MESSAGE.len()], 0);
-            assert!(buf[SKELETON_MESSAGE.len() + 1..].iter().all(|b| *b == 0x7F));
+            assert_eq!(buf[NO_ERROR_MESSAGE.len()], 0);
+            assert!(buf[NO_ERROR_MESSAGE.len() + 1..].iter().all(|b| *b == 0x7F));
         });
     }
 
@@ -1534,6 +1679,9 @@ mod tests {
         with_driver(|driver| {
             let mut infos: [ASIOBufferInfo; 2] = unsafe { core::mem::zeroed() };
             let mut callbacks: ASIOCallbacks = unsafe { core::mem::zeroed() };
+            // Two distinct output channels: a repeated `channelNum` is refused, so
+            // the second entry has to name a slot of its own.
+            infos[1].channel_num = 1;
             assert_eq!(
                 unsafe { asio_create_buffers(driver, infos.as_mut_ptr(), 2, 512, &mut callbacks) },
                 ASE_OK
@@ -1550,6 +1698,39 @@ mod tests {
                 // They start silent; M5.3 fills the outputs from the pipe.
                 assert_eq!(unsafe { *(first as *const f32) }, 0.0);
             }
+            assert_eq!(unsafe { asio_dispose_buffers(driver) }, ASE_OK);
+        });
+    }
+
+    #[test]
+    fn create_buffers_rejects_an_unknown_or_repeated_channel() {
+        with_driver(|driver| {
+            let mut infos: [ASIOBufferInfo; 2] = unsafe { core::mem::zeroed() };
+            let mut callbacks: ASIOCallbacks = unsafe { core::mem::zeroed() };
+
+            // Outside 0..16: it would index past the driver's own 16-slot table.
+            infos[0].channel_num = CHANNEL_COUNT;
+            assert_eq!(
+                unsafe { asio_create_buffers(driver, infos.as_mut_ptr(), 1, 512, &mut callbacks) },
+                ASE_InvalidParameter
+            );
+
+            // Two entries claiming the same slot would drop one of them silently.
+            infos[0].channel_num = 3;
+            infos[1].channel_num = 3;
+            assert_eq!(
+                unsafe { asio_create_buffers(driver, infos.as_mut_ptr(), 2, 512, &mut callbacks) },
+                ASE_InvalidParameter
+            );
+
+            // The same number on an input and an output is not a repeat: asio.h
+            // numbers the two directions in their own spaces.
+            infos[1].channel_num = 3;
+            infos[1].is_input = ASIO_TRUE;
+            assert_eq!(
+                unsafe { asio_create_buffers(driver, infos.as_mut_ptr(), 2, 512, &mut callbacks) },
+                ASE_OK
+            );
             assert_eq!(unsafe { asio_dispose_buffers(driver) }, ASE_OK);
         });
     }
@@ -1652,6 +1833,7 @@ mod tests {
         with_driver(|driver| {
             let mut infos: [ASIOBufferInfo; 2] = unsafe { core::mem::zeroed() };
             let mut callbacks: ASIOCallbacks = unsafe { core::mem::zeroed() };
+            infos[1].channel_num = 1;
             callbacks.buffer_switch_time_info = Some(counting_buffer_switch);
             assert_eq!(
                 unsafe { asio_create_buffers(driver, infos.as_mut_ptr(), 2, 512, &mut callbacks) },

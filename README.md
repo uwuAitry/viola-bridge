@@ -196,12 +196,11 @@ kept in sync between the two processes.
 **Channel-count note (deliberate).** The WDM side of a virtual audio device is
 stereo, so this path carries 2 channels: it proves the *live chain*
 (DAW → virtual device → pipe → bridge → renderer), not 9.1.6's sixteen. Getting
-sixteen live channels needs one of the options in
-[docs/cloud-boundary.md §4](docs/cloud-boundary.md) — either the ASIO SDK at CI
-build time, or a multichannel virtual device. **M5 takes the ASIO route**, in a
-separate driver rather than in the feeder: see
-[16-channel ASIO device (M5)](#16-channel-asio-device-m5) below. `viola_feeder`
-itself stays the 2-channel WASAPI path.
+sixteen live channels needed a decision on how to get them into the chain;
+[docs/cloud-boundary.md §4](docs/cloud-boundary.md) records it and the routes that
+were dropped. **M5 settles it with the ASIO route**, in a separate driver rather
+than in the feeder: see [16-channel ASIO device (M5)](#16-channel-asio-device-m5)
+below. `viola_feeder` itself stays the 2-channel WASAPI path.
 
 See [docs/cloud-boundary.md](docs/cloud-boundary.md) for the rule that produced
 that choice.
@@ -220,12 +219,38 @@ endpoint it offers still stops at 8 channels, so 16 channels would have to be
 reassembled from two captures. `viola_asio` is built entirely in CI, needs no
 other software installed, and hands the DAW's sixteen channels to the same
 `\\.\pipe\orender.input` that `viola_feeder` already streams into.
-
 The driver is a user-mode COM in-process server (`DllGetClassObject` /
 `DllCanUnloadNow`). The host finds it through the two registry locations that
 [docs/asio-driver-notes.md](docs/asio-driver-notes.md) records from the SDK's
 `common/register.cpp`. One fixed GUID is both the CLSID and the interface IID,
 and is written into the source rather than generated at install time.
+
+### How the sixteen channels reach the pipe
+
+The DAW writes the driver's **output** channels, and the driver copies the half
+the host is *not* about to fill (`index ^ 1` of the `bufferSwitch` index — see
+[docs/viola-asio-contract.md](docs/viola-asio-contract.md) for why), and the
+driver copies that half into a lock-free ring. A pipe thread drains the ring,
+writes one 44-byte streaming-WAV header per connection and then interleaved
+little-endian `f32` samples in the fixed 16-channel order, so `viola_bridge`
+parses it exactly as it parses `viola_feeder`. The driver is the pipe **client**:
+`orender` creates `\\.\pipe\orender.input` and waits for it. A block that does
+not fit the ring is dropped rather than overwriting samples the reader has not
+taken; the driver counts the drops in `%ProgramData%\viola-asio\viola-asio.log`.
+
+### Verifying it locally
+
+`scripts/viola-asio-pipe-probe.ps1` loads the built DLL, drives it through the
+ASIO entry points the way a host would, and reads the pipe back. With no engine
+running it acts as the pipe server itself, so it needs only the DLL:
+
+```powershell
+pwsh -File scripts/viola-asio-pipe-probe.ps1 -DllPath dist\viola-asio-windows-x86_64\viola_asio.dll
+```
+
+Pass `-Orender` the engine executable to run the real engine as the server instead
+(`-Layout`, `-ToneHz` and `-Seconds` shape the probe tone; `-Channels`
+defaults to 16). The script never writes the renderer's config.
 
 ### Installing it
 
@@ -284,6 +309,7 @@ crates/viola_bridge/         the plugin (cdylib)
   src/bridge.rs              FormatBridge impl + label map
   src/pcm.rs                 sample encodings + streaming WAV header scanner
 crates/viola_asio/           the virtual ASIO driver (cdylib, M5)
+scripts/viola-asio-pipe-probe.ps1  load the DLL and read back the pipe
 scripts/bootstrap.ps1        fetch the pinned upstream bridge_api
 scripts/fetch-asiosdk.ps1    fetch the pinned ASIO SDK (build time only)
 scripts/register-asio.ps1    register the driver (dry run unless -Apply)
