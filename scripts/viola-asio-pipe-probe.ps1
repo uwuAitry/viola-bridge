@@ -31,6 +31,9 @@ param(
     # engine the server and turns this script into the thing that starts it.
     [string]$Orender = '',
     [string]$Layout = "$env:LOCALAPPDATA\Programs\Omniphony Studio\layouts\9.1.6.yaml",
+    # The decoder bridge the engine loads. Only used with -Orender; without it the
+    # engine falls back to its own config, which may point at a bridge that is gone.
+    [string]$BridgePath = (Join-Path $PSScriptRoot '..\dist\viola-bridge-windows-x86_64\viola_bridge.dll'),
     [string]$ProbeDir = (Join-Path $PSScriptRoot '..\probe'),
     # 16 in + 16 out: every driver output carries a tone, so 16 channels arrive.
     [int]$Channels = 16,
@@ -109,14 +112,18 @@ if ($Orender) {
     # ---- engine-as-server mode ------------------------------------------------
     if (-not (Test-Path $Orender)) { throw "missing: $Orender" }
     if (-not (Test-Path $Layout)) { throw "missing: $Layout" }
+    if (-not (Test-Path $BridgePath)) { throw "missing bridge: $BridgePath (build viola_bridge or pass -BridgePath)" }
 
     $engineOut = Join-Path $ProbeDir 'asio_pipe_render.f32'
     Remove-Item $engineOut -ErrorAction SilentlyContinue
     # The engine creates the pipe and waits for a client; the driver is that
-    # client, exactly as `viola_feeder/src/pipe.rs` records.
+    # client, exactly as `viola_feeder/src/pipe.rs` records. Pass the bridge
+    # explicitly: without it the engine falls back to its own config, which may
+    # name a bridge path that no longer exists.
     $argLine = @(
         'render', "`"$pipePath`"",
         '--continuous',
+        '--bridge-path', "`"$BridgePath`"",
         '--enable-vbap',
         '--speaker-layout', "`"$Layout`"",
         '--output-backend', 'file',
@@ -125,6 +132,7 @@ if ($Orender) {
     ) -join ' '
     Write-Host "engine : $Orender"
     Write-Host "pipe   : $pipePath"
+    Write-Host "bridge : $BridgePath"
     $engine = Start-Process -FilePath $Orender -ArgumentList $argLine `
         -RedirectStandardOutput (Join-Path $ProbeDir 'asio_pipe_engine_stdout.txt') `
         -RedirectStandardError (Join-Path $ProbeDir 'asio_pipe_engine.log') -PassThru
