@@ -295,9 +295,11 @@ function Write-Line([string]$label, [string]$value) { Write-Host ("{0,-17}: {1}"
 
 $clsidGuid = [Guid]$Clsid
 $unknown   = [IntPtr]::Zero
-$clsidGuid = [Guid]$Clsid
-$unknown   = [IntPtr]::Zero
 if ($DllPath) {
+    # LoadLibraryW wants an absolute path: it does not search the current directory
+    # (or PowerShell's location) for a relative one, and fails with error 126 when
+    # handed `dist\...\viola_asio.dll`. Resolve here so callers may pass either form.
+    $DllPath = (Resolve-Path -LiteralPath $DllPath -ErrorAction Stop).Path
     $detail = ''
     $unknown = [AsioComProbe]::InstantiateFromDll($DllPath, $Clsid, [ref]$detail)
     Write-Line 'CLSID' $Clsid

@@ -206,6 +206,15 @@ try {
         }
     }
     if (-not $probe.HasExited) {
+        # The driver drops its pipe client at stop(); the probe then finishes
+        # disposeBuffers and Release and exits on its own ~0.5 s later. Give it
+        # that grace period instead of killing a probe that is simply tidying up.
+        $grace = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $grace -and -not $probe.HasExited) {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    if (-not $probe.HasExited) {
         $probe.Kill()
         Write-Warning 'the COM probe did not exit in time; killed'
     }
