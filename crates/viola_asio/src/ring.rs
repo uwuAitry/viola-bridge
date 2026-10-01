@@ -240,7 +240,6 @@ impl Tap {
         &scratch[..]
     }
 }
-}
 
 #[cfg(test)]
 mod tests {
