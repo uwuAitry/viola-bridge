@@ -252,6 +252,23 @@ Pass `-Orender` the engine executable to run the real engine as the server inste
 (`-Layout`, `-ToneHz` and `-Seconds` shape the probe tone; `-Channels`
 defaults to 16). The script never writes the renderer's config.
 
+### Hearing it
+
+`scripts/live-playout.ps1` closes the loop: the engine's stdout is piped straight
+into `ffplay`, so the rendered audio comes out of the default output device and no
+growing dump file is left behind. With a DAW open on the ASIO driver the driver is
+already the pipe client, and the script only has to run the engine + player:
+
+```powershell
+pwsh -File scripts/live-playout.ps1 -NoFeeder            # DAW drives the pipe
+pwsh -File scripts/live-playout.ps1 -Seconds 20         # feeder sources it
+```
+
+Without `-NoFeeder` it captures the default endpoint (or `-Device`) through
+`viola_feeder` and plays a test tone so there is something to hear. Never run both
+sources at once: whichever connects second fails with `os error 231`
+(`ERROR_PIPE_BUSY`), because the engine serves a single client.
+
 ### Installing it
 
 CI publishes the artifact `viola-asio-windows-x86_64` (`viola_asio.dll` +
@@ -309,6 +326,7 @@ crates/viola_bridge/         the plugin (cdylib)
   src/bridge.rs              FormatBridge impl + label map
   src/pcm.rs                 sample encodings + streaming WAV header scanner
 crates/viola_asio/           the virtual ASIO driver (cdylib, M5)
+scripts/live-playout.ps1    render straight into ffplay (hear it)
 scripts/viola-asio-pipe-probe.ps1  load the DLL and read back the pipe
 scripts/bootstrap.ps1        fetch the pinned upstream bridge_api
 scripts/fetch-asiosdk.ps1    fetch the pinned ASIO SDK (build time only)
