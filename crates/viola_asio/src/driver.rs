@@ -1097,9 +1097,19 @@ fn wake(handle: &WinHandle) {
 /// of our own: this is the only place that must not be late.
 fn tick_loop(handle: WinHandle, period_100ns: u64, stop: Arc<AtomicU32>, shared: Arc<Tick>) {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
-    // Negative means "relative", which is what re-arming every period needs.
-    let due: i64 = -(period_100ns as i64);
+    // Arm against an *absolute* schedule, not "one period from now". A relative
+    // re-arm adds whatever the host callback took to every period, so the driver's
+    // clock runs slow - measured at ~90/s instead of the required 48000/512 =
+    // 93.75/s, a 4% deficit that starves the pipe and is audible as stutter.
+    // Chasing a fixed deadline keeps the long-run rate exact no matter how long a
+    // single tick takes.
+    let period = period_100ns as i64;
+    let start = Instant::now();
+    let mut next: i64 = period;
     while stop.load(Ordering::Acquire) == 0 {
+        let now = (start.elapsed().as_nanos() / 100) as i64;
+        next = tick_deadline(next, now, period);
+        let due: i64 = -(next - now);
         let armed = unsafe {
             SetWaitableTimer(handle.0, &due, 0, ptr::null_mut(), ptr::null_mut(), 0)
         };
@@ -1113,7 +1123,22 @@ fn tick_loop(handle: WinHandle, period_100ns: u64, stop: Arc<AtomicU32>, shared:
             break;
         }
         shared.tick();
+        next += period;
     }
+}
+
+/// The deadline the tick thread should wait for, in the same 100 ns units as
+/// `period`. While the schedule is on time this is just `next`; once it has
+/// slipped past, the deadline advances by whole periods until it is in the
+/// future again. Re-anchoring rather than firing a burst of back-to-back
+/// callbacks matters because audio is realtime: a backlog of catch-up switches
+/// is not a recovery, it is a second stutter. The `+ 1` guarantees the result is
+/// strictly greater than `now` for every `period > 0`.
+fn tick_deadline(next: i64, now: i64, period: i64) -> i64 {
+    if next > now || period <= 0 {
+        return next;
+    }
+    next + period * ((now - next) / period + 1)
 }
 
 /// Where the driver reports what it is doing. Asio has no logging of its own, and
@@ -1857,5 +1882,43 @@ mod tests {
 
             assert_eq!(unsafe { asio_dispose_buffers(driver) }, ASE_OK);
         });
+    }
+
+    /// The driver's tick must keep an exact long-run rate. Re-arming the timer
+    /// relative to "now" adds the host callback's duration to every period, which
+    /// measured out at ~90 callbacks/s instead of 48000/512 = 93.75/s - a 4%
+    /// deficit that starves the pipe and is heard as stutter. This test simulates
+    /// that same work-per-tick and pins the cadence, because a regression here is
+    /// otherwise only visible as an audible glitch.
+    #[test]
+    fn tick_deadline_keeps_the_long_run_rate_exact() {
+        // 512 frames at 48 kHz, in the 100 ns units `SetWaitableTimer` wants.
+        let period = 106_667i64;
+        // 0.45 ms - what a tick actually costs in the host's callback.
+        let work = 4_500i64;
+        let window = 10 * HUNDRED_NS_PER_SECOND as i64;
+
+        let mut next = period;
+        let mut now = 0i64;
+        let mut ticks = 0i64;
+        while now < window {
+            next = tick_deadline(next, now, period);
+            assert!(next > now, "deadline {next} is not in the future of {now}");
+            // Deadlines only ever land on the original schedule's grid.
+            assert_eq!(next % period, 0);
+            now = next + work;
+            ticks += 1;
+        }
+
+        // A relative re-arm would give ~900 here; the absolute schedule gives 938.
+        assert!(
+            (936..=940).contains(&ticks),
+            "{ticks} ticks in {window} units: the schedule is not holding"
+        );
+
+        // On time, the deadline is returned untouched.
+        assert_eq!(tick_deadline(period, period - 1, period), period);
+        // Degenerate period must not divide by zero.
+        assert_eq!(tick_deadline(5, 1_000, 0), 5);
     }
 }
