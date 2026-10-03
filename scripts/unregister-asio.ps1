@@ -160,6 +160,8 @@ Write-Host ''
 Write-Host 'Installed DLL:'
 Write-Host ('  left in place    {0}' -f $InstalledDll)
 Write-Host '                   (unregistering never deletes files; remove it by hand if wanted)'
+Write-Host ('  panel            {0}' -f (Join-Path $InstallDir 'viola-panel.exe'))
+Write-Host '                   (staged by register-asio.ps1 -PanelExe; also left in place)'
 Write-Host ''
 
 if ($Apply) {

@@ -18,6 +18,7 @@ Background reading: [`docs/asio-driver-notes.md`](asio-driver-notes.md).
 | CLSID, **also used as the interface IID** | `{6C1E7D94-3A52-4B8F-9E27-5D0B4C8A1F63}` |
 | Installed DLL directory | `C:\ProgramData\viola-asio\` |
 | Installed DLL path | `C:\ProgramData\viola-asio\viola_asio.dll` |
+| Installed panel path | `C:\ProgramData\viola-asio\viola-panel.exe` (optional) |
 
 The GUID is fixed in source (`crates/viola_asio/src/guid.rs`) **and** written
 into `scripts/register-asio.ps1`. It is never generated at install time: the host
@@ -46,6 +47,7 @@ crates/viola_asio/
   src/pipe.rs       streaming-WAV header + the pipe client thread (M5.3)
 scripts/
   register-asio.ps1     installs the DLL + writes both registry locations
+                        (with -PanelExe: also stages viola-panel.exe beside it)
   unregister-asio.ps1   removes them, backing up to .reg first
 ```
 
@@ -67,6 +69,27 @@ lands) and copy it to the installed path above.
   dependency list at zero.
 * Every claim in a comment that states a fact about the SDK should name the file
 it came from (`common/iasiodrv.h`, `host/pc/asiolist.cpp`, …).
+
+## `controlPanel()` — the host's control-panel button
+
+`driver.rs` answers `controlPanel()` (slot 18) by launching the panel instead of
+returning a bare error:
+
+* The panel is looked for as `viola-panel.exe` **in this DLL's own directory**,
+  which is why the installer stages it beside `viola_asio.dll`. The DLL path comes
+  from `GetModuleHandleExW` (by address) + `GetModuleFileNameW`; asking about
+  `NULL` would answer with the *host's* executable, not ours.
+* Nothing is built in-process. `ShellExecuteW` is the only way across, since the
+  panel is a separate program with a single-instance mutex of its own.
+* A panel that is already up is raised via `FindWindowW("viola-panel")` +
+  `ShowWindow(SW_RESTORE)` + `SetForegroundWindow`, because a second launch would
+  exit at once and look like the button did nothing.
+* `ASE_OK` / `ASE_NotPresent` report only whether the shell accepted the request.
+  asio.h states the host **ignores** the return code, so this value never decided
+  whether the button was greyed out — it only ever meant "nothing opened".
+
+Still hand-rolled FFI, still no crates: `shell32` and `user32` are linked for
+`ShellExecuteW` and the window calls, alongside the existing `kernel32` block.
 
 ## M5.3 data path — from the host's buffers to the pipe
 

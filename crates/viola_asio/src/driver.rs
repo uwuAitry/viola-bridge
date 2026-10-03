@@ -41,8 +41,10 @@
 use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -122,6 +124,29 @@ unsafe extern "system" {
     fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
     fn GetSystemTimeAsFileTime(out: *mut u64);
     fn GetLocalTime(out: *mut LocalSystemTime);
+    fn GetModuleHandleExW(flags: u32, address: *const c_void, module: *mut *mut c_void) -> i32;
+    fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+}
+
+/// `ShellExecuteW` (shellapi.h) is in shell32, not kernel32.
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        window: *mut c_void,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> *mut c_void;
+}
+
+/// `FindWindowW`/`ShowWindow`/`SetForegroundWindow` are in user32.
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
+    fn ShowWindow(window: *mut c_void, command: i32) -> i32;
+    fn SetForegroundWindow(window: *mut c_void) -> i32;
 }
 
 /// `SYSTEMTIME` (minwinbase.h), the layout `GetLocalTime` fills in. Only used to
@@ -990,13 +1015,125 @@ unsafe extern "system" fn asio_dispose_buffers(this: *mut Driver) -> ASIOError {
     }
 }
 
+/// `SW_SHOWNORMAL` (winuser.h): show the panel at its normal size and position.
+const SW_SHOWNORMAL: i32 = 1;
+/// `ShellExecuteW` documents every result above this as success (shellapi.h).
+const SHELL_EXECUTE_MIN_SUCCESS: isize = 32;
+/// The longest path `GetModuleFileNameW` is asked to produce. It reports a full
+/// buffer as a successful call, so a path that fills this is not trusted.
+const PANEL_PATH_CAP: usize = 32_768;
+/// The executable this DLL expects beside it; see `panel_exe_path`.
+const PANEL_EXE_NAME: &str = "viola-panel.exe";
+/// `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS` (libloaderapi.h): name a module by an
+/// address inside it, which is how this DLL identifies itself without a
+/// `DllMain` to cache its `HINSTANCE`.
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+/// `GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT`: do not pin the module, so the
+/// host may still unload us the way it always could.
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+/// `SW_RESTORE` (winuser.h): un-minimise before raising, or a minimised panel
+/// would come back to the foreground still collapsed.
+const SW_RESTORE: i32 = 9;
+/// The title `viola-panel` gives its own window (`with_title` in its `main.rs`),
+/// which is how this DLL recognises a panel that is already up.
+const PANEL_WINDOW_TITLE: &str = "viola-panel";
+
+/// UTF-16 with a terminating NUL: the form every `...W` entry point wants.
+fn wide(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(core::iter::once(0)).collect()
+}
+
+/// `viola-panel.exe` beside *this* module, or `None` if this DLL's own path
+/// cannot be read.
+///
+/// The panel installs next to the driver (`C:\ProgramData\viola-asio\`), so the
+/// DLL's directory is the one local, registry-free way to find it: no `PATH`
+/// entry to maintain, and moving the pair moves both. This asks about *this*
+/// module, never `GetModuleFileNameW(NULL, ..)` — `NULL` answers with the
+/// *host's* executable and would send us looking in Studio One's folder.
+fn panel_exe_path() -> Option<PathBuf> {
+    let mut module: *mut c_void = ptr::null_mut();
+    let flags =
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    let found = unsafe {
+        GetModuleHandleExW(
+            flags,
+            asio_control_panel as *const () as *const c_void,
+            &mut module as *mut *mut c_void,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; PANEL_PATH_CAP];
+    let length = unsafe { GetModuleFileNameW(module, buffer.as_mut_ptr(), PANEL_PATH_CAP as u32) };
+    // Zero is failure; a full buffer means the path was truncated, and half a
+    // path is worse than none.
+    if length == 0 || length as usize >= PANEL_PATH_CAP {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    let module_path = PathBuf::from(OsString::from_wide(&buffer));
+    Some(module_path.parent()?.join(PANEL_EXE_NAME))
+}
+
+/// Any top-level window with exactly this title, or `None`.
+fn find_window(title: &str) -> Option<*mut c_void> {
+    let title = wide(OsStr::new(title));
+    let found = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
+    if found.is_null() { None } else { Some(found) }
+}
+
+/// Hand `viola-panel.exe` to the shell and report whether it took the request.
+///
+/// A panel that is already up is raised instead of started: it holds a
+/// single-instance mutex, so a second launch would exit at once and the visible
+/// result would be nothing happening - the very complaint this fixes. Raising is
+/// permitted here because the caller is the host the user just clicked in.
+///
+/// All this can report: `ShellExecuteW` does not tell us whether the panel came
+/// up, and the host ignores the answer anyway.
+fn launch_panel() -> bool {
+    let Some(exe) = panel_exe_path() else {
+        return false;
+    };
+    if let Some(window) = find_window(PANEL_WINDOW_TITLE) {
+        unsafe {
+            ShowWindow(window, SW_RESTORE);
+            SetForegroundWindow(window);
+        }
+        return true;
+    }
+    let file = wide(exe.as_os_str());
+    let operation = wide(OsStr::new("open"));
+    let directory = exe.parent().map(|dir| wide(dir.as_os_str()));
+    let shown = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            ptr::null(),
+            directory.as_ref().map_or(ptr::null(), |dir| dir.as_ptr()),
+            SW_SHOWNORMAL,
+        )
+    };
+    shown as isize > SHELL_EXECUTE_MIN_SUCCESS
+}
+
 /// `controlPanel()` — 18.
 ///
-/// asio.h: "If no panel is available `ASE_NotPresent` will be returned", and the
-/// host ignores the result. There is nothing to configure yet; when there is,
-/// this becomes a settings window rather than a bare return.
+/// asio.h: "request the driver to start a control panel component for device
+/// specific user settings". The same header notes the return code is ignored,
+/// so `ASE_NotPresent` never greyed this button out — it only meant that
+/// nothing opened. The panel is a whole separate program, so there is no window
+/// to build in-process: `ShellExecuteW` starts `viola-panel.exe` and this
+/// returns whether the shell took the request.
 unsafe extern "system" fn asio_control_panel(_this: *mut Driver) -> ASIOError {
-    ASE_NotPresent
+    if launch_panel() {
+        ASE_OK
+    } else {
+        ASE_NotPresent
+    }
 }
 
 /// `future(long selector, void *opt)` — 19.
@@ -1636,6 +1773,8 @@ mod tests {
             assert_eq!(unsafe { asio_start(driver) }, ASE_InvalidMode);
             assert_eq!(unsafe { asio_stop(driver) }, ASE_OK);
             assert_eq!(unsafe { asio_dispose_buffers(driver) }, ASE_InvalidMode);
+            // No `viola-panel.exe` sits beside the test executable, so the
+            // launch is refused: the documented "no panel available" answer.
             assert_eq!(unsafe { asio_control_panel(driver) }, ASE_NotPresent);
             assert_eq!(
                 unsafe { asio_future(driver, 0, ptr::null_mut()) },
@@ -1650,6 +1789,25 @@ mod tests {
                 ASE_InvalidParameter
             );
         });
+    }
+
+    #[test]
+    fn control_panel_searches_beside_this_module() {
+        // In a test binary "this module" is the test executable, so the lookup
+        // must land in the test executable's own directory. The defect this
+        // guards is asking about `NULL`, which answers with the *host's* path
+        // and would have us looking for the panel in Studio One's folder.
+        let candidate = panel_exe_path().expect("this module has a path");
+        assert_eq!(candidate.file_name().unwrap(), OsStr::new(PANEL_EXE_NAME));
+        let here = std::env::current_exe().expect("the test executable has a path");
+        assert_eq!(candidate.parent(), here.parent());
+    }
+
+    #[test]
+    fn window_lookup_reports_no_match() {
+        // Exercises the user32 binding without depending on what is on screen:
+        // a title nothing owns must come back as no window, not a stale handle.
+        assert!(find_window("viola-panel-no-such-window-4f2a").is_none());
     }
 
     #[test]

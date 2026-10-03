@@ -35,12 +35,16 @@
 # Usage:
 #   pwsh -File scripts/register-asio.ps1                    # preview (safe)
 #   pwsh -File scripts/register-asio.ps1 -Apply             # from an elevated shell
-#   pwsh -File scripts/register-asio.ps1 -DllPath <path> -Apply
+#   pwsh -File scripts/register-asio.ps1 -DllPath <path> -PanelExe <path> -Apply
 [CmdletBinding()]
 param(
     # Where the CI artifact lands by default:
     #   gh run download --name viola-asio-windows-x86_64 --dir dist
     [string]$DllPath = (Join-Path $PSScriptRoot '..\dist\viola-asio-windows-x86_64\viola_asio.dll'),
+    # Optional: stage viola-panel.exe beside the DLL. The driver's
+    # controlPanel() looks for it in its own directory (crates/viola_asio/src/driver.rs,
+    # panel_exe_path), so this is how the host's control-panel button finds it.
+    [string]$PanelExe = '',
     [switch]$Apply
 )
 
@@ -57,6 +61,7 @@ $Clsid        = '{6C1E7D94-3A52-4B8F-9E27-5D0B4C8A1F63}'
 $Description  = 'viola-bridge ASIO'
 $InstallDir   = 'C:\ProgramData\viola-asio'
 $InstalledDll = Join-Path $InstallDir 'viola_asio.dll'
+$InstalledPanel = Join-Path $InstallDir 'viola-panel.exe'
 $AsioKeyName  = 'viola-bridge ASIO'
 
 $ClsidKey  = "HKLM:\SOFTWARE\Classes\CLSID\$Clsid"
@@ -131,6 +136,27 @@ if ($sourceFound) {
     }
 }
 
+# The panel is staged the same way as the DLL: a SHA256 comparison decides
+# whether the copy is needed, and an omitted -PanelExe means the installed
+# panel is left exactly as it is.
+$panelSource     = ''
+$panelRequested  = -not [string]::IsNullOrWhiteSpace($PanelExe)
+$panelFound      = $false
+$panelCopyNeeded = $false
+$panelHash       = $null
+if ($panelRequested) {
+    $panelSource = [System.IO.Path]::GetFullPath($PanelExe)
+    $panelFound  = Test-Path -LiteralPath $panelSource -PathType Leaf
+}
+if ($panelFound) {
+    $panelHash = (Get-FileHash -LiteralPath $panelSource -Algorithm SHA256).Hash
+    if (Test-Path -LiteralPath $InstalledPanel -PathType Leaf) {
+        $panelCopyNeeded = $panelHash -ne (Get-FileHash -LiteralPath $InstalledPanel -Algorithm SHA256).Hash
+    } else {
+        $panelCopyNeeded = $true
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -142,6 +168,7 @@ if ($Apply) {
 }
 Write-Host ('  source DLL  : {0}' -f $sourceDll)
 Write-Host ('  installs to : {0}' -f $InstalledDll)
+Write-Host ('  panel       : {0}' -f $(if ($panelRequested) { $panelSource } else { '(not requested)' }))
 Write-Host ('  elevated    : {0}' -f $(if ($elevated) { 'yes' } else { 'NO' }))
 Write-Host ''
 
@@ -158,7 +185,13 @@ if ($Apply -and -not $sourceFound) {
     Write-Host '        gh run download --name viola-asio-windows-x86_64 --dir dist'
     exit 1
 }
-if ($Apply -and $valueChanges -eq 0 -and -not $copyNeeded) {
+if ($Apply -and $panelRequested -and -not $panelFound) {
+    Write-Host 'STOP: -PanelExe was given but that file does not exist.'
+    Write-Host ('      {0}' -f $panelSource)
+    Write-Host '      Build viola-panel and point -PanelExe at its viola-panel.exe.'
+    exit 1
+}
+if ($Apply -and $valueChanges -eq 0 -and -not $copyNeeded -and -not $panelCopyNeeded) {
     Write-Host 'Nothing to do: every value already matches and the installed DLL is identical.'
     exit 0
 }
@@ -219,6 +252,27 @@ if (-not $sourceFound) {
 Write-Host ''
 
 # ---------------------------------------------------------------------------
+# The panel executable (optional): the driver finds it beside itself
+# ---------------------------------------------------------------------------
+Write-Host 'Panel executable:'
+if (-not $panelRequested) {
+    Write-Host '  not requested    (pass -PanelExe <path> to stage viola-panel.exe)'
+} elseif (-not $panelFound) {
+    Write-Host ('  source missing   {0}' -f $panelSource)
+} elseif (-not $panelCopyNeeded) {
+    Write-Host ('  already current  {0}' -f $InstalledPanel)
+} elseif (-not $Apply) {
+    Write-Host ('  would copy       {0}' -f $panelSource)
+    Write-Host ('                -> {0}' -f $InstalledPanel)
+    Write-Host ('  sha256           {0}' -f $panelHash)
+} else {
+    Copy-Item -LiteralPath $panelSource -Destination $InstalledPanel -Force
+    Write-Host ('  copied           {0}' -f $panelSource)
+    Write-Host ('                -> {0}' -f $InstalledPanel)
+}
+Write-Host ''
+
+# ---------------------------------------------------------------------------
 # The registry values
 # ---------------------------------------------------------------------------
 Write-Host 'Registry:'
@@ -262,7 +316,7 @@ foreach ($entry in $plan) {
 Write-Host ''
 
 if ($Apply) {
-    Write-Host ('Applied: {0} registry value(s) written; DLL {1}.' -f $written, $(if ($copyNeeded) { 'copied' } else { 'already current' }))
+    Write-Host ('Applied: {0} registry value(s) written; DLL {1}; panel {2}.' -f $written, $(if ($copyNeeded) { 'copied' } else { 'already current' }), $(if (-not $panelRequested) { 'not requested' } elseif (-not $panelFound) { 'missing' } elseif ($panelCopyNeeded) { 'copied' } else { 'already current' }))
     Write-Host 'Uninstall with scripts/unregister-asio.ps1.'
 } else {
     Write-Host ('DRY RUN complete: {0} registry value(s) would change.' -f $valueChanges)
